@@ -303,6 +303,11 @@ public class ClaudeAnalyzer
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            // claude.exe emite/consome UTF-8. Sem isto, o .NET usa a code page do
+            // console (CP850/1252) e os acentos chegam corrompidos ("obrigatÃ³ria").
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
             UseShellExecute = false,
             CreateNoWindow = true,
             WorkingDirectory = _opts.ReportsDirectory
