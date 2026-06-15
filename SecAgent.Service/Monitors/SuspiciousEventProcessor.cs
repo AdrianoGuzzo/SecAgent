@@ -105,6 +105,7 @@ public class SuspiciousEventProcessor : BackgroundService
         windowStart = DateTime.MinValue;
         windowEnd = DateTime.UtcNow;
 
+        if (!_opts.IncidentAutoAnalysisEnabled) return false;   // manual analysis only
         if (_window.Count < _opts.IncidentEventThreshold) return false;
         if (DateTime.UtcNow - _lastFiredUtc < TimeSpan.FromMinutes(_opts.IncidentCooldownMinutes))
             return false;

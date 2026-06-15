@@ -26,6 +26,8 @@ evita complexidade de permissões cross-session.
 |---|---|---|
 | `status.json` | Service → Tray | Severity agregado + último scan/incident (Tray polleia 10s) |
 | `progress.json` | Service → Tray | Estado vivo durante scan/analyze; existe só durante work (Tray watcher + timer 2s) |
+| `network.json` | Service → Tray | Snapshot de conexões TCP ativas (entrada/saída + processo); reescrito a cada ~2s pelo `NetworkSnapshotService`. Lido pelo dashboard do Tray |
+| `alerts/alert_*.json` | Service → Tray | Alerta imediato de conexão de ENTRADA de IP público; Tray (sempre ativo) emite toast com país. Portas sensíveis = crítico |
 | `triggers/*.trigger` | Tray → Service | `scan-only.trigger` ou `scan-and-analyze.trigger`; effêmero (Service deleta após processar) |
 | `reports/*.md`, `scans/*.json`, `events/*.jsonl` | Service escreve | Histórico (Tray watcher emite toast quando aparecem) |
 
@@ -67,9 +69,12 @@ Service (LocalSystem) lê do registro de máquina.
 5. **Trace logging** em `C:\ProgramData\SecAgent\trace.log` (escrito por
    `ScanRunner` e `ClaudeAnalyzer`) é a melhor janela de debug do pipeline
    scan→Claude. EventLog do Windows só pega Warning+ do framework.
-6. **Token gasto pelo serviço** — daily scan ~$0.10 equiv API; incident
-   analysis ~$0.025; triggers via tray = ditto. Monitore consumo se rodar
-   triggers manuais com frequência.
+6. **Análise com IA é manual por padrão** — `Claude.AnalyzeAfterScan=false` e
+   `Monitors.IncidentAutoAnalysisEnabled=false`. O scan diário roda **grátis**
+   (scan-only) e incidentes só são logados (sem chamar o Claude). A IA só roda
+   quando o usuário clica "scan + análise" (tray/painel) → `RunScanAndAnalyzeAsync`.
+   Para religar a IA automática, ponha essas flags em `true`. Custo por análise
+   manual: ~$0.08-0.12 equiv (scan) / ~$0.025 (incidente).
 
 ## Build commands
 

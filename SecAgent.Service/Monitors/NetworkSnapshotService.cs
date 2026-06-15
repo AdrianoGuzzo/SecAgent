@@ -30,8 +30,12 @@ public class NetworkSnapshotService : BackgroundService
     private readonly ChannelWriter<SecurityEvent> _writer;
     private readonly MonitorOptions _opts;
     private readonly HashSet<int> _inboundPortWhitelist;
+    private readonly HashSet<int> _sensitivePorts;
     private readonly List<string> _selfFragments;
+    private readonly Dictionary<string, DateTime> _lastAlertPerIp = new();
+    private readonly object _alertLock = new();
     private HashSet<string> _seenInbound = new();
+    private int _alertSeq;
 
     public NetworkSnapshotService(
         ILogger<NetworkSnapshotService> logger,
@@ -42,6 +46,7 @@ public class NetworkSnapshotService : BackgroundService
         _writer = channel.Writer;
         _opts = opts.Value;
         _inboundPortWhitelist = new HashSet<int>(_opts.InboundPortWhitelist);
+        _sensitivePorts = new HashSet<int>(_opts.SensitiveInboundPorts);
         _selfFragments = _opts.SelfReferenceFragments ?? new List<string>();
     }
 
@@ -54,6 +59,8 @@ public class NetworkSnapshotService : BackgroundService
         }
 
         _logger.LogInformation("NetworkSnapshotService started (snapshot every {Sec}s)", _opts.NetworkSnapshotSeconds);
+
+        try { Directory.CreateDirectory(_opts.AlertsDirectory); PruneOldAlerts(); } catch { }
 
         // Baseline so we don't fire inbound events for connections that already
         // existed when the service started.
@@ -118,14 +125,17 @@ public class NetworkSnapshotService : BackgroundService
     private void MaybeEmitInbound(string key, IpHlpApi.TcpConnectionRow r, string procName)
     {
         if (!_opts.EmitInboundEvents) return;
-        if (_seenInbound.Contains(key)) return;               // already alerted
+        if (_seenInbound.Contains(key)) return;               // already handled this connection
         if (_inboundPortWhitelist.Contains(r.LocalPort)) return;
         if (IsSelfReference(procName)) return;
 
+        bool sensitive = _sensitivePorts.Contains(r.LocalPort);
+
+        // 1) SecurityEvent → slower incident/Claude pipeline.
         var evt = new SecurityEvent(
             TimestampUtc: DateTime.UtcNow,
             Source: "network",
-            Severity: "medium",
+            Severity: sensitive ? "high" : "medium",
             Title: $"Conexão de entrada de {r.RemoteAddress}:{r.RemotePort}",
             Description: "Um host externo (IP público) abriu uma conexão de ENTRADA para esta máquina. Pode ser acesso legítimo (ex.: serviço exposto) ou tentativa de acesso não autorizado.",
             Details: new Dictionary<string, string>
@@ -135,9 +145,80 @@ public class NetworkSnapshotService : BackgroundService
                 ["remotePort"] = r.RemotePort.ToString(),
                 ["localPort"] = r.LocalPort.ToString(),
                 ["processName"] = procName,
-                ["pid"] = r.OwningPid.ToString()
+                ["pid"] = r.OwningPid.ToString(),
+                ["sensitivePort"] = sensitive ? "true" : "false"
             });
         _writer.TryWrite(evt);
+
+        // 2) Immediate alert file → always-on Tray toast (per-IP cooldown).
+        WriteAlertIfDue(r, procName, sensitive);
+    }
+
+    private void WriteAlertIfDue(IpHlpApi.TcpConnectionRow r, string procName, bool sensitive)
+    {
+        var ip = r.RemoteAddress.ToString();
+        lock (_alertLock)
+        {
+            if (_lastAlertPerIp.TryGetValue(ip, out var last) &&
+                DateTime.UtcNow - last < TimeSpan.FromMinutes(_opts.InboundAlertCooldownMinutes))
+                return;
+            _lastAlertPerIp[ip] = DateTime.UtcNow;
+        }
+
+        var portLabel = PortLabel(r.LocalPort);
+        var alert = new NetworkAlert(
+            TimestampUtc: DateTime.UtcNow,
+            Severity: sensitive ? "critical" : "medium",
+            RemoteAddress: ip,
+            RemotePort: r.RemotePort,
+            LocalPort: r.LocalPort,
+            ProcessName: procName,
+            SensitivePort: sensitive,
+            PortLabel: portLabel,
+            Title: sensitive ? "Acesso externo a porta sensível!" : "Conexão externa detectada",
+            Message: $"{ip} → {portLabel} · {procName}");
+
+        try
+        {
+            Directory.CreateDirectory(_opts.AlertsDirectory);
+            int seq = Interlocked.Increment(ref _alertSeq);
+            var name = $"alert_{DateTime.UtcNow:yyyy-MM-dd_HHmmssfff}_{seq}.json";
+            var path = Path.Combine(_opts.AlertsDirectory, name);
+            // Unique, write-once file → direct write (a tmp+rename would raise a
+            // Renamed event, which the Tray's Created-only watcher would miss).
+            File.WriteAllText(path, JsonSerializer.Serialize(alert, JsonOpts));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to write inbound alert file");
+        }
+    }
+
+    private static string PortLabel(int port) => port switch
+    {
+        21   => "FTP (porta 21)",
+        22   => "SSH (porta 22)",
+        23   => "Telnet (porta 23)",
+        135  => "RPC (porta 135)",
+        139  => "NetBIOS (porta 139)",
+        445  => "SMB / compartilhamento (porta 445)",
+        1433 => "SQL Server (porta 1433)",
+        3306 => "MySQL (porta 3306)",
+        3389 => "RDP / área de trabalho remota (porta 3389)",
+        5900 or 5901 => $"VNC (porta {port})",
+        5985 or 5986 => $"WinRM (porta {port})",
+        _ => $"porta {port}"
+    };
+
+    private void PruneOldAlerts()
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow.AddDays(-7);
+            foreach (var f in new DirectoryInfo(_opts.AlertsDirectory).GetFiles("alert_*.json"))
+                if (f.LastWriteTimeUtc < cutoff) { try { f.Delete(); } catch { } }
+        }
+        catch { /* best effort */ }
     }
 
     private void WriteSnapshotAtomic(NetworkSnapshot snapshot)

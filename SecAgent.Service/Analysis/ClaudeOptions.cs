@@ -7,5 +7,7 @@ public class ClaudeOptions
     public string Model { get; set; } = "sonnet";
     public int TimeoutSeconds { get; set; } = 300;
     public string ReportsDirectory { get; set; } = @"C:\ProgramData\SecAgent\reports";
-    public bool AnalyzeAfterScan { get; set; } = true;
+    // Controls ONLY scheduled scans. false = scheduled scans are free (scan-only);
+    // the manual "scan + análise" button always analyzes regardless.
+    public bool AnalyzeAfterScan { get; set; } = false;
 }

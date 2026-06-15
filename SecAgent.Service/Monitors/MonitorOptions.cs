@@ -27,10 +27,19 @@ public class MonitorOptions
 
     // Network snapshot (live connections table + inbound alerting)
     public bool NetworkSnapshotEnabled { get; set; } = true;
-    public int NetworkSnapshotSeconds { get; set; } = 5;
+    public int NetworkSnapshotSeconds { get; set; } = 2;
     public bool EmitInboundEvents { get; set; } = true;
     public List<int> InboundPortWhitelist { get; set; } = new();
     public string SnapshotPath { get; set; } = @"C:\ProgramData\SecAgent\network.json";
+
+    // Immediate inbound alerts (toast via Tray). Sensitive (admin/remote-access)
+    // ports raise a "critical" alert; others "medium".
+    public string AlertsDirectory { get; set; } = @"C:\ProgramData\SecAgent\alerts";
+    public int InboundAlertCooldownMinutes { get; set; } = 10;
+    public List<int> SensitiveInboundPorts { get; set; } = new()
+    {
+        21, 22, 23, 135, 139, 445, 1433, 3306, 3389, 5900, 5901, 5985, 5986
+    };
 
     // Event log monitor
     public bool EventLogMonitorEnabled { get; set; } = true;
@@ -38,6 +47,9 @@ public class MonitorOptions
     public List<int> SystemEventIds { get; set; } = new() { 7045 };
 
     // Incident processor
+    // When false, events are still logged to JSONL (free, feeds the live feed),
+    // but Claude is NOT invoked automatically — analysis is manual only.
+    public bool IncidentAutoAnalysisEnabled { get; set; } = false;
     public int IncidentEventThreshold { get; set; } = 5;
     public int IncidentWindowMinutes { get; set; } = 30;
     public int IncidentCooldownMinutes { get; set; } = 60;   // don't fire Claude again within this period

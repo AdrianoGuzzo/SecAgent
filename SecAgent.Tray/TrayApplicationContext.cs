@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using SecAgent.Tray.Models;
 
 namespace SecAgent.Tray;
 
@@ -13,6 +14,7 @@ public class TrayApplicationContext : ApplicationContext
     private const string EventsDir = @"C:\ProgramData\SecAgent\events";
     private const string ScansDir = @"C:\ProgramData\SecAgent\scans";
     private const string TriggersDir = @"C:\ProgramData\SecAgent\triggers";
+    private const string AlertsDir = @"C:\ProgramData\SecAgent\alerts";
 
     private const string ScanOnlyTrigger = "scan-only.trigger";
     private const string ScanAndAnalyzeTrigger = "scan-and-analyze.trigger";
@@ -29,7 +31,11 @@ public class TrayApplicationContext : ApplicationContext
     private readonly FileSystemWatcher? _reportWatcher;
     private readonly FileSystemWatcher? _scanWatcher;
     private readonly FileSystemWatcher? _progressWatcher;
+    private readonly FileSystemWatcher? _alertWatcher;
     private readonly Dictionary<string, DateTime> _lastTriggerClickUtc = new();
+
+    // Shared, always-on geolocation client (used by alerts + the dashboard pump).
+    private readonly GeoLookup _geo = new();
 
     private AgentStatus? _status;
     private AnalysisProgress? _currentProgress;
@@ -37,12 +43,16 @@ public class TrayApplicationContext : ApplicationContext
     // The icon to show when no work is in progress (driven by status.json severity).
     private Icon _severityIcon = SystemIcons.Information;
 
+    private DataPump? _dataPump;
+    private DashboardForm? _dashboard;
+
     public TrayApplicationContext()
     {
         Directory.CreateDirectory(DataDir);
         Directory.CreateDirectory(ReportsDir);
         Directory.CreateDirectory(EventsDir);
         Directory.CreateDirectory(ScansDir);
+        Directory.CreateDirectory(AlertsDir);
 
         _icon = new NotifyIcon
         {
@@ -51,7 +61,8 @@ public class TrayApplicationContext : ApplicationContext
             Visible = true,
             ContextMenuStrip = BuildMenu()
         };
-        _icon.MouseDoubleClick += (_, _) => OpenLast("report_*.md");
+        _icon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowDashboard(); };
+        _icon.MouseDoubleClick += (_, _) => ShowDashboard();
 
         _statusTimer = new System.Windows.Forms.Timer { Interval = 10_000 };
         _statusTimer.Tick += (_, _) => RefreshStatus();
@@ -96,6 +107,19 @@ public class TrayApplicationContext : ApplicationContext
         }
         catch { }
 
+        // Always-on: toast immediately when the Service writes an inbound alert,
+        // even with the dashboard closed.
+        try
+        {
+            _alertWatcher = new FileSystemWatcher(AlertsDir, "alert_*.json")
+            {
+                EnableRaisingEvents = true,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite
+            };
+            _alertWatcher.Created += OnNewAlert;
+        }
+        catch { }
+
         // If a progress file is already on disk when the tray starts (service
         // was mid-scan when tray launched), pick it up.
         OnProgressFileEvent(this, null!);
@@ -104,6 +128,8 @@ public class TrayApplicationContext : ApplicationContext
     private ContextMenuStrip BuildMenu()
     {
         var menu = new ContextMenuStrip();
+        menu.Items.Add("Abrir painel", null, (_, _) => ShowDashboard());
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Forçar scan agora (sem Claude — grátis)", null,
             (_, _) => RequestTrigger(ScanOnlyTrigger, "Scan iniciado, aguarde ~5s..."));
         menu.Items.Add("Forçar scan + análise Claude (~$0.16)", null,
@@ -150,6 +176,44 @@ public class TrayApplicationContext : ApplicationContext
         {
             _icon.ShowBalloonTip(5000, "SecAgent",
                 "Falha ao solicitar trigger: " + ex.Message, ToolTipIcon.Error);
+        }
+    }
+
+    private void ShowDashboard()
+    {
+        if (_dashboard is { IsDisposed: false })
+        {
+            if (_dashboard.WindowState == FormWindowState.Minimized)
+                _dashboard.WindowState = FormWindowState.Normal;
+            _dashboard.Show();
+            _dashboard.Activate();
+            _dashboard.BringToFront();
+            return;
+        }
+
+        _dataPump = new DataPump(_geo);
+        _dashboard = new DashboardForm(_dataPump, OnDashboardCommand);
+        _dashboard.FormClosed += (_, _) =>
+        {
+            _dataPump?.Dispose();
+            _dataPump = null;
+            _dashboard = null;
+        };
+        _dataPump.Start();          // emits initial snapshot (buffered until page ready)
+        _dashboard.Show();
+        _dashboard.Activate();
+    }
+
+    private void OnDashboardCommand(string cmd)
+    {
+        switch (cmd)
+        {
+            case "scanOnly":
+                RequestTrigger(ScanOnlyTrigger, "Varredura iniciada, aguarde ~5s...");
+                break;
+            case "scanAndAnalyze":
+                RequestTrigger(ScanAndAnalyzeTrigger, "Varredura + análise iniciadas, aguarde ~1-2 min...");
+                break;
         }
     }
 
@@ -332,6 +396,55 @@ public class TrayApplicationContext : ApplicationContext
         RefreshStatus();
     }
 
+    private async void OnNewAlert(object sender, FileSystemEventArgs e)
+    {
+        var alert = ReadAlert(e.FullPath);
+        if (alert is null) return;
+
+        // Enrich with country (cache hit = instant; bounded timeout otherwise).
+        GeoLookup.GeoInfo? geo = null;
+        try { geo = await _geo.ResolveNowAsync(alert.RemoteAddress); } catch { }
+
+        var loc = geo is not null
+            ? $"{Flag(geo.CountryCode)} {geo.Country}".Trim() + " · "
+            : "";
+        var text = loc + alert.Message;
+        var icon = string.Equals(alert.Severity, "critical", StringComparison.OrdinalIgnoreCase)
+            ? ToolTipIcon.Error : ToolTipIcon.Warning;
+
+        void Show() => _icon.ShowBalloonTip(8000, "SecAgent: " + alert.Title, text, icon);
+        if (_icon.ContextMenuStrip?.InvokeRequired == true)
+            _icon.ContextMenuStrip.BeginInvoke(Show);
+        else
+            Show();
+    }
+
+    private static NetworkAlert? ReadAlert(string path)
+    {
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var sr = new StreamReader(fs, Encoding.UTF8);
+                var json = sr.ReadToEnd();
+                if (!string.IsNullOrWhiteSpace(json))
+                    return JsonSerializer.Deserialize<NetworkAlert>(json, JsonOpts);
+            }
+            catch { }
+            Thread.Sleep(80);
+        }
+        return null;
+    }
+
+    private static string Flag(string? cc)
+    {
+        if (string.IsNullOrEmpty(cc) || cc.Length != 2) return "🌐";
+        cc = cc.ToUpperInvariant();
+        return char.ConvertFromUtf32(0x1F1E6 + (cc[0] - 'A')) +
+               char.ConvertFromUtf32(0x1F1E6 + (cc[1] - 'A'));
+    }
+
     private void OnNewScan(object sender, FileSystemEventArgs e)
     {
         if (_icon.ContextMenuStrip?.InvokeRequired == true)
@@ -364,6 +477,10 @@ public class TrayApplicationContext : ApplicationContext
             _reportWatcher?.Dispose();
             _scanWatcher?.Dispose();
             _progressWatcher?.Dispose();
+            _alertWatcher?.Dispose();
+            _dataPump?.Dispose();
+            _dashboard?.Dispose();
+            _geo.Dispose();
         }
         base.Dispose(disposing);
     }

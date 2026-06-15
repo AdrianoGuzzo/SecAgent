@@ -55,6 +55,9 @@ public class ScanRunner
         }
     }
 
+    // Always runs Claude after the scan. Used by the manual "scan + análise"
+    // button. Scheduled scans go through the Worker, which decides whether to
+    // analyze (free scan-only by default) — automatic AI is opt-in via config.
     public async Task RunScanAndAnalyzeAsync(string trigger, CancellationToken ct)
     {
         _progress.BeginScan(trigger);
@@ -62,7 +65,6 @@ public class ScanRunner
         {
             var scan = await DoScanAsync(ct);
             if (scan is null) return;
-            if (!_claudeOptions.AnalyzeAfterScan) return;
 
             _progress.EndScanBeginAnalysis(
                 Path.GetFileName(scan.Value.ScanPath),

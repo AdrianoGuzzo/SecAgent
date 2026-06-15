@@ -21,12 +21,38 @@ Target: `net8.0-windows`. WinExe (não tem console).
 
 ```
 Program.cs                    # entry point [STAThread] → Application.Run(new TrayApplicationContext())
-TrayApplicationContext.cs     # ApplicationContext: NotifyIcon, ContextMenuStrip, watchers, timers
+TrayApplicationContext.cs     # ApplicationContext: NotifyIcon, ContextMenuStrip, watchers, timers, ShowDashboard
+DashboardForm.cs              # janela WebView2 (painel amigável); init async + runtime check + fallback .md
+DataPump.cs                   # lê todos os arquivos do Service e empurra mensagens p/ a página (só com janela aberta)
+GeoLookup.cs                  # ip-api.com (país/cidade/ISP) com cache + rate-limit; instância
+                              # compartilhada e sempre ativa (alertas + dashboard); ResolveNowAsync p/ toast
+Assets/dashboard.html         # SPA (EmbeddedResource) renderizada via NavigateToString
 AgentStatus.cs                # mirror do schema do Service (evita project reference)
 AnalysisProgress.cs           # mirror do schema do Service
+Models/                       # mirrors: AnalysisResult/Finding/Meta, SecurityEvent, IncidentReport, NetworkSnapshot/Connection
 install-tray.ps1              # publish + registra HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SecAgentTray
 uninstall-tray.ps1
 ```
+
+## Painel (DashboardForm + WebView2)
+
+Clique no ícone (esquerdo ou duplo) ou menu "Abrir painel" abre uma única
+janela (singleton em `_dashboard`). O **host C# faz toda a leitura de arquivo**
+(via `DataPump`); a página WebView2 só renderiza.
+
+- C# → página: `CoreWebView2.PostWebMessageAsJson({type,payload})`. Tipos:
+  `status`, `progress`, `report`, `incident`, `events`, `network`, `geo`.
+- Página → C#: botões de scan via `chrome.webview.postMessage({cmd})` →
+  `DashboardForm` → callback `OnDashboardCommand` → `RequestTrigger` (mesmo
+  debounce do menu).
+- **Casing**: o Service grava JSON **PascalCase**; a página lê **camelCase**.
+  `DataPump.ReadAndCamel<T>` desserializa e re-serializa com `JsonNamingPolicy.
+  CamelCase` (idem `OutOpts` para events/geo). Não pular essa normalização.
+- WebView2: pacote NuGet `Microsoft.Web.WebView2`; user-data em
+  `%LOCALAPPDATA%\SecAgent\WebView2`. Runtime já vem no Win11; se faltar,
+  `DashboardForm` cai no fallback de abrir o `.md`.
+- `DataPump` só roda enquanto a janela está aberta (Start/Stop); os watchers
+  do ícone (abaixo) continuam independentes.
 
 ## Padrão arquitetural
 
@@ -54,8 +80,12 @@ worker thread.
 | `status.json` | LER | Cada 10s (timer) + após FSWatcher de report |
 | `progress.json` | LER | Sempre que muda; existe só durante work ativo |
 | `reports\*.md` | OBSERVAR | Toast quando novo |
+| `reports\*.json` | LER | Dashboard: findings (report_*) e incidente (incident_*) |
 | `scans\*.json` | OBSERVAR | Toast quando novo (só se progress=null/scanning) |
-| `triggers\*.trigger` | ESCREVER | Quando user clica menu (debounce 30s) |
+| `events\*.jsonl` | LER (tail) | Dashboard: feed ao vivo (offset em bytes, virada de dia UTC) |
+| `network.json` | LER | Dashboard: tabela de conexões (entrada/saída + geo) |
+| `alerts\alert_*.json` | OBSERVAR | **Sempre ativo** (não só com painel): toast imediato de conexão externa de entrada, com país (via `GeoLookup`) |
+| `triggers\*.trigger` | ESCREVER | Quando user clica menu/botão do painel (debounce 30s) |
 
 ## Estado do ícone
 

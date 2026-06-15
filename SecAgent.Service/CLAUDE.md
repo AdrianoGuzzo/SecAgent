@@ -39,7 +39,11 @@ Collectors/                 # Fase 1+4.2 — coleta dados do sistema
 
 Monitors/                   # Fase 3 — push/poll em tempo real
   ProcessMonitor            # WMI __InstanceCreationEvent ISA Win32_Process WITHIN 2
-  NetworkMonitor            # poll 30s + diff de conexões TCP estabelecidas
+  NetworkMonitor            # poll 30s + diff de conexões TCP estabelecidas (só saída)
+  NetworkSnapshotService    # poll 2s; GetExtendedTcpTable (PID por conexão) → network.json;
+                            # classifica entrada/saída; SecurityEvent + alerts/alert_*.json p/
+                            # entrada de IP público (porta sensível=critical; cooldown por IP)
+  Native/IpHlpApi           # P/Invoke GetExtendedTcpTable (v4+v6) com PID; byte-swap de portas
   EventLogMonitor           # EventLogWatcher push em Security + System
   SuspiciousEventProcessor  # consumer do Channel; sliding window; threshold → Claude
   MonitorOptions            # whitelists, eventIds, thresholds, SelfReferenceFragments
@@ -153,3 +157,9 @@ Models/
 | Análise Claude de incidente (Haiku) | ~15-30s | ~$0.025 |
 
 Daily scan + análise: ~$3-4/mês equivalente. Sustentável no Pro/Max.
+
+**Por padrão a IA é manual** (`AnalyzeAfterScan=false`,
+`IncidentAutoAnalysisEnabled=false`): o scan diário e o de startup rodam
+scan-only (grátis) e incidentes só são logados. Só o botão "scan + análise"
+(tray/painel) gasta tokens — `RunScanAndAnalyzeAsync` sempre analisa,
+independente do `AnalyzeAfterScan` (que controla só o scheduled).
