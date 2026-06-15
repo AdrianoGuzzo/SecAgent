@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="SecAgent.Service/SecAgent.Service.csproj" />
+  <Project Path="SecAgent.Spike/SecAgent.Spike.csproj" />
+  <Project Path="SecAgent.Tray/SecAgent.Tray.csproj" />
+</Solution>

@@ -1,0 +1,202 @@
+using System.Diagnostics;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading.Channels;
+using Microsoft.Extensions.Options;
+using SecAgent.Service.Models;
+using SecAgent.Service.Monitors.Native;
+
+namespace SecAgent.Service.Monitors;
+
+/// <summary>
+/// Periodically enumerates ALL established TCP connections (with owning process)
+/// and writes a network.json snapshot for the Tray dashboard to render a live
+/// connections table. Unlike the legacy NetworkMonitor (outbound diff only),
+/// this also classifies inbound connections and — when enabled — emits a
+/// SecurityEvent for each NEW inbound connection from a public IP, so external
+/// access (RDP/SMB/etc.) flows into the existing incident/Claude pipeline.
+/// </summary>
+public class NetworkSnapshotService : BackgroundService
+{
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        WriteIndented = false,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    private readonly ILogger<NetworkSnapshotService> _logger;
+    private readonly ChannelWriter<SecurityEvent> _writer;
+    private readonly MonitorOptions _opts;
+    private readonly HashSet<int> _inboundPortWhitelist;
+    private readonly List<string> _selfFragments;
+    private HashSet<string> _seenInbound = new();
+
+    public NetworkSnapshotService(
+        ILogger<NetworkSnapshotService> logger,
+        Channel<SecurityEvent> channel,
+        IOptions<MonitorOptions> opts)
+    {
+        _logger = logger;
+        _writer = channel.Writer;
+        _opts = opts.Value;
+        _inboundPortWhitelist = new HashSet<int>(_opts.InboundPortWhitelist);
+        _selfFragments = _opts.SelfReferenceFragments ?? new List<string>();
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (!_opts.NetworkSnapshotEnabled)
+        {
+            _logger.LogInformation("NetworkSnapshotService disabled by config");
+            return;
+        }
+
+        _logger.LogInformation("NetworkSnapshotService started (snapshot every {Sec}s)", _opts.NetworkSnapshotSeconds);
+
+        // Baseline so we don't fire inbound events for connections that already
+        // existed when the service started.
+        try { _seenInbound = SnapshotInboundKeys(); } catch { /* first cycle will rebuild */ }
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                BuildAndWriteSnapshot();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "NetworkSnapshotService cycle failed");
+            }
+
+            try { await Task.Delay(TimeSpan.FromSeconds(_opts.NetworkSnapshotSeconds), stoppingToken); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    private void BuildAndWriteSnapshot()
+    {
+        var listeners = GetListenerPorts();
+        var pidNames = BuildPidNameMap();
+        var rows = IpHlpApi.GetEstablishedConnections();
+
+        var connections = new List<NetworkConnection>(rows.Count);
+        var currentInbound = new HashSet<string>();
+
+        foreach (var r in rows)
+        {
+            // Direction: if our local port is one we're listening on, the peer
+            // initiated the connection → inbound. Otherwise outbound.
+            bool inbound = listeners.Contains(r.LocalPort);
+            string direction = inbound ? "inbound" : "outbound";
+            bool remotePublic = !IsZero(r.RemoteAddress) && NetworkMonitor.IsPublicAddress(r.RemoteAddress);
+            string procName = pidNames.TryGetValue(r.OwningPid, out var n) ? n : "desconhecido";
+
+            connections.Add(new NetworkConnection(
+                Direction: direction,
+                LocalAddress: r.LocalAddress.ToString(),
+                LocalPort: r.LocalPort,
+                RemoteAddress: r.RemoteAddress.ToString(),
+                RemotePort: r.RemotePort,
+                ProcessName: procName,
+                Pid: r.OwningPid,
+                RemoteIsPublic: remotePublic));
+
+            if (inbound && remotePublic)
+            {
+                var key = $"{r.RemoteAddress}:{r.RemotePort}|{r.LocalPort}";
+                currentInbound.Add(key);
+                MaybeEmitInbound(key, r, procName);
+            }
+        }
+
+        _seenInbound = currentInbound;
+        WriteSnapshotAtomic(new NetworkSnapshot(DateTime.UtcNow, connections));
+    }
+
+    private void MaybeEmitInbound(string key, IpHlpApi.TcpConnectionRow r, string procName)
+    {
+        if (!_opts.EmitInboundEvents) return;
+        if (_seenInbound.Contains(key)) return;               // already alerted
+        if (_inboundPortWhitelist.Contains(r.LocalPort)) return;
+        if (IsSelfReference(procName)) return;
+
+        var evt = new SecurityEvent(
+            TimestampUtc: DateTime.UtcNow,
+            Source: "network",
+            Severity: "medium",
+            Title: $"Conexão de entrada de {r.RemoteAddress}:{r.RemotePort}",
+            Description: "Um host externo (IP público) abriu uma conexão de ENTRADA para esta máquina. Pode ser acesso legítimo (ex.: serviço exposto) ou tentativa de acesso não autorizado.",
+            Details: new Dictionary<string, string>
+            {
+                ["direction"] = "inbound",
+                ["remoteAddress"] = r.RemoteAddress.ToString(),
+                ["remotePort"] = r.RemotePort.ToString(),
+                ["localPort"] = r.LocalPort.ToString(),
+                ["processName"] = procName,
+                ["pid"] = r.OwningPid.ToString()
+            });
+        _writer.TryWrite(evt);
+    }
+
+    private void WriteSnapshotAtomic(NetworkSnapshot snapshot)
+    {
+        var path = _opts.SnapshotPath;
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(snapshot, JsonOpts));
+        File.Move(tmp, path, overwrite: true);
+    }
+
+    private static HashSet<int> GetListenerPorts()
+    {
+        var set = new HashSet<int>();
+        try
+        {
+            foreach (var ep in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
+                set.Add(ep.Port);
+        }
+        catch { /* best effort */ }
+        return set;
+    }
+
+    private static Dictionary<int, string> BuildPidNameMap()
+    {
+        var map = new Dictionary<int, string>();
+        foreach (var p in Process.GetProcesses())
+        {
+            try { map[p.Id] = p.ProcessName; }
+            catch { /* exited / access denied */ }
+            finally { p.Dispose(); }
+        }
+        return map;
+    }
+
+    private HashSet<string> SnapshotInboundKeys()
+    {
+        var listeners = GetListenerPorts();
+        var keys = new HashSet<string>();
+        foreach (var r in IpHlpApi.GetEstablishedConnections())
+        {
+            if (!listeners.Contains(r.LocalPort)) continue;
+            if (IsZero(r.RemoteAddress) || !NetworkMonitor.IsPublicAddress(r.RemoteAddress)) continue;
+            keys.Add($"{r.RemoteAddress}:{r.RemotePort}|{r.LocalPort}");
+        }
+        return keys;
+    }
+
+    private bool IsSelfReference(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (var frag in _selfFragments)
+            if (!string.IsNullOrEmpty(frag) && text.Contains(frag, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    private static bool IsZero(IPAddress addr)
+        => addr.Equals(IPAddress.Any) || addr.Equals(IPAddress.IPv6Any);
+}
