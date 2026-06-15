@@ -6,7 +6,8 @@
 ; Tray. Compile via SecAgent.Installer\build-installer.ps1 (que publica os
 ; binarios em publish\Service e publish\Tray antes de chamar o ISCC).
 ;
-; Inno Setup 6 requerido (winget install JRSoftware.InnoSetup).
+; Inno Setup 6.1+ requerido (usa ExecAsOriginalUser).
+; winget install JRSoftware.InnoSetup
 
 #define AppName "SecAgent"
 #define AppVersion "1.0.0"
@@ -71,6 +72,7 @@ var
   BtnBrowse: TNewButton;
   RbPaste, RbGenerate, RbSkip: TNewRadioButton;
   EditToken: TNewEdit;
+  BtnGenTerm: TNewButton;
   LblClaudeStatus: TNewStaticText;
   ClaudeFound: Boolean;
   ResolvedToken: string;   // token final a gravar ('' = pular)
@@ -101,7 +103,9 @@ end;
 
 procedure UpdateTokenControls();
 begin
-  EditToken.Enabled := RbPaste.Checked;
+  { O mesmo campo de token serve para "colar" e para "gerar" (o usuario cola
+    o token impresso pelo terminal). }
+  EditToken.Enabled := RbPaste.Checked or RbGenerate.Checked;
   { Gerar so faz sentido se achamos o claude.exe }
   RbGenerate.Enabled := EditClaude.Text <> '';
   if (not RbGenerate.Enabled) and RbGenerate.Checked then begin
@@ -109,6 +113,9 @@ begin
     RbPaste.Checked := True;
     EditToken.Enabled := True;
   end;
+  { Botao de abrir o terminal so quando "gerar" esta ativo e ha claude.exe }
+  if BtnGenTerm <> nil then
+    BtnGenTerm.Enabled := RbGenerate.Checked and (Trim(EditClaude.Text) <> '');
 end;
 
 procedure RadioClicked(Sender: TObject);
@@ -128,6 +135,31 @@ begin
   F := EditClaude.Text;
   if GetOpenFileName('Selecione o claude.exe', F, '', 'Executavel (*.exe)|*.exe|Todos (*.*)|*.*', 'exe') then
     EditClaude.Text := F;
+end;
+
+{ ----- Abre um terminal real e interativo para 'claude setup-token' ----- }
+
+procedure GenTerminalClicked(Sender: TObject);
+var
+  Code: Integer;
+begin
+  if Trim(EditClaude.Text) = '' then begin
+    MsgBox('Informe o caminho do claude.exe primeiro.', mbError, MB_OK);
+    exit;
+  end;
+  { 'cmd /k' mantem a janela aberta para o usuario ler/copiar o token e ver
+    eventuais erros. ExecAsOriginalUser roda DESelevado, no contexto do
+    usuario logado (%USERPROFILE%, PATH, navegador e credenciais do claude
+    corretos). ewNoWait: nao trava o wizard enquanto o usuario faz o login.
+    Sem redirecionar a saida -> claude tem um TTY real e mostra a URL e os
+    prompts (corrige a "tela preta"). }
+  ExecAsOriginalUser(ExpandConstant('{cmd}'),
+    '/k ""' + Trim(EditClaude.Text) + '" setup-token"',
+    '', SW_SHOW, ewNoWait, Code);
+  MsgBox('Um terminal foi aberto para o login do Claude.'#13#10 +
+         'Conclua o login no navegador, copie o token exibido (sk-ant-oat...) '#13#10 +
+         'e cole no campo de token desta tela antes de clicar em Avancar.',
+         mbInformation, MB_OK);
 end;
 
 { ----- Monta a pagina custom ----- }
@@ -178,12 +210,20 @@ begin
   RbGenerate.Parent := TokenPage.Surface;
   RbGenerate.Top := EditToken.Top + EditToken.Height + 14;
   RbGenerate.Width := TokenPage.SurfaceWidth;
-  RbGenerate.Caption := 'Gerar um token agora (executa claude setup-token, abre o navegador)';
+  RbGenerate.Caption := 'Gerar agora: abre um terminal para o login e cole o token gerado no campo acima';
   RbGenerate.OnClick := @RadioClicked;
+
+  BtnGenTerm := TNewButton.Create(WizardForm);
+  BtnGenTerm.Parent := TokenPage.Surface;
+  BtnGenTerm.Top := RbGenerate.Top + RbGenerate.Height + 4;
+  BtnGenTerm.Left := 16;
+  BtnGenTerm.Width := 240;
+  BtnGenTerm.Caption := 'Abrir terminal (claude setup-token)';
+  BtnGenTerm.OnClick := @GenTerminalClicked;
 
   RbSkip := TNewRadioButton.Create(WizardForm);
   RbSkip.Parent := TokenPage.Surface;
-  RbSkip.Top := RbGenerate.Top + RbGenerate.Height + 14;
+  RbSkip.Top := BtnGenTerm.Top + BtnGenTerm.Height + 14;
   RbSkip.Width := TokenPage.SurfaceWidth;
   RbSkip.Caption := 'Pular (configurar depois) - o servico instala, mas a analise com IA fica inativa';
   RbSkip.OnClick := @RadioClicked;
@@ -199,55 +239,6 @@ begin
 
   RbPaste.Checked := True;
   UpdateTokenControls();
-end;
-
-{ ----- Extrai 'sk-ant-oat...' de um texto qualquer ----- }
-
-function IsTokenChar(C: Char): Boolean;
-begin
-  Result := ((C >= 'a') and (C <= 'z')) or
-            ((C >= 'A') and (C <= 'Z')) or
-            ((C >= '0') and (C <= '9')) or
-            (C = '-') or (C = '_');
-end;
-
-function ExtractToken(const Text: string): string;
-var
-  P, I: Integer;
-begin
-  Result := '';
-  P := Pos('sk-ant-oat', Text);
-  if P = 0 then exit;
-  I := P;
-  while (I <= Length(Text)) and IsTokenChar(Text[I]) do
-    Inc(I);
-  Result := Copy(Text, P, I - P);
-end;
-
-{ ----- Roda 'claude setup-token' e captura o token ----- }
-
-function GenerateToken(const ClaudePath: string): string;
-var
-  TmpFile, CmdLine, Content: string;
-  Code: Integer;
-  Lines: TArrayOfString;
-  I: Integer;
-begin
-  Result := '';
-  TmpFile := ExpandConstant('{tmp}\claude_token.txt');
-  { Redireciona stdout+stderr para um arquivo temporario }
-  CmdLine := '/c ""' + ClaudePath + '" setup-token > "' + TmpFile + '" 2>&1"';
-  if not Exec(ExpandConstant('{cmd}'), CmdLine, '', SW_SHOW, ewWaitUntilTerminated, Code) then begin
-    MsgBox('Nao foi possivel executar o claude setup-token.', mbError, MB_OK);
-    exit;
-  end;
-  if LoadStringsFromFile(TmpFile, Lines) then begin
-    Content := '';
-    for I := 0 to GetArrayLength(Lines) - 1 do
-      Content := Content + Lines[I] + #10;
-    Result := ExtractToken(Content);
-  end;
-  DeleteFile(TmpFile);
 end;
 
 { ----- Validacao ao sair da pagina de token ----- }
@@ -266,10 +257,16 @@ begin
     exit;
   end;
 
-  if RbPaste.Checked then begin
+  { Colar e Gerar usam o mesmo campo: em "gerar", o usuario abriu o terminal
+    (botao) e colou aqui o token impresso pelo claude setup-token. }
+  if RbPaste.Checked or RbGenerate.Checked then begin
     T := Trim(EditToken.Text);
     if T = '' then begin
-      MsgBox('Cole o token ou escolha outra opcao.', mbError, MB_OK);
+      if RbGenerate.Checked then
+        MsgBox('Cole o token gerado no terminal (botao "Abrir terminal") ou escolha outra opcao.',
+               mbError, MB_OK)
+      else
+        MsgBox('Cole o token ou escolha outra opcao.', mbError, MB_OK);
       Result := False;
       exit;
     end;
@@ -279,24 +276,6 @@ begin
         Result := False;
         exit;
       end;
-    end;
-    ResolvedToken := T;
-    exit;
-  end;
-
-  if RbGenerate.Checked then begin
-    if ResolvedClaude = '' then begin
-      MsgBox('Informe o caminho do claude.exe para gerar o token.', mbError, MB_OK);
-      Result := False;
-      exit;
-    end;
-    T := GenerateToken(ResolvedClaude);
-    if T = '' then begin
-      MsgBox('Nao consegui capturar o token da saida do claude setup-token.'#13#10 +
-             'Gere manualmente (claude setup-token) e use a opcao "Colar token".',
-             mbError, MB_OK);
-      Result := False;
-      exit;
     end;
     ResolvedToken := T;
     exit;
@@ -361,6 +340,58 @@ begin
   RunSc('description {#ServiceName} "{#ServiceDesc}"');
   RunSc('failure {#ServiceName} reset= 86400 actions= restart/60000/restart/60000/restart/60000');
   RunSc('start {#ServiceName}');
+end;
+
+{ ----- Espera o servico chegar em STOPPED (ou inexistir), liberando o lock ----- }
+
+function WaitServiceStopped(TimeoutMs: Integer): Boolean;
+var
+  TmpFile, Content: string;
+  Raw: AnsiString;
+  Code, Elapsed: Integer;
+begin
+  Result := False;
+  TmpFile := ExpandConstant('{tmp}\sc_query.txt');
+  Elapsed := 0;
+  while Elapsed < TimeoutMs do begin
+    { Exec nao captura stdout; redireciona via cmd para um arquivo temp }
+    Exec(ExpandConstant('{cmd}'),
+         '/c sc query {#ServiceName} > "' + TmpFile + '" 2>&1',
+         '', SW_HIDE, ewWaitUntilTerminated, Code);
+    if LoadStringFromFile(TmpFile, Raw) then begin
+      Content := string(Raw);
+      { STOPPED = parado; 1060 = servico nao existe -> nada a esperar }
+      if (Pos('STOPPED', Content) > 0) or (Pos('1060', Content) > 0) then begin
+        Result := True;
+        break;
+      end;
+    end else begin
+      Result := True;
+      break;
+    end;
+    Sleep(500);
+    Elapsed := Elapsed + 500;
+  end;
+  DeleteFile(TmpFile);
+end;
+
+{ ----- Antes de copiar [Files]: parar servico + Tray que travam os .exe ----- }
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Code: Integer;
+begin
+  Result := '';
+  { 1) Parar o servico (LocalSystem) que segura SecAgent.Service.exe. Roda
+       independente do login, por isso a reinstalacao cross-login dava
+       "acesso negado" na sobrescrita. }
+  RunSc('stop {#ServiceName}');
+  WaitServiceStopped(15000);
+  { 2) Matar o Tray (qualquer sessao) que segura SecAgent.Tray.exe }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/im SecAgent.Tray.exe /f /t',
+       '', SW_HIDE, ewWaitUntilTerminated, Code);
+  { 3) Folga para liberar os handles antes da copia }
+  Sleep(1000);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
