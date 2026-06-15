@@ -12,6 +12,7 @@ assinatura Pro/Max via OAuth, não API) para análise estruturada.
 | `SecAgent.Service` | Worker Service (.NET 8) | LocalSystem | Toda a lógica de coleta, monitores, Claude e persistência |
 | `SecAgent.Tray` | WinForms (.NET 8) | usuário logado | NotifyIcon + menu + toast notifications |
 | `SecAgent.Spike` | Worker Service (descartável) | LocalSystem | Histórico — validou auth do Claude. **Não deployar.** |
+| `SecAgent.Installer` | Inno Setup (`.iss` + `.ps1`) | — | Gera `SecAgent-Setup.exe` (self-contained) que instala Service+Tray, registra o serviço e configura o token do Claude. Ver `SecAgent.Installer\CLAUDE.md`. |
 
 Cada projeto tem seu próprio `CLAUDE.md` com detalhes. Este aqui cobre o que
 é transversal.
