@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -144,12 +145,45 @@ public sealed class DashboardForm : Form
         catch { /* nothing else to do */ }
     }
 
+    /// <summary>
+    /// Loads dashboard.html and inlines its external CSS/JS into a single string.
+    /// NavigateToString renders without a base URI, so &lt;link&gt;/&lt;script src&gt;
+    /// can't resolve on their own — we read each referenced embedded resource and
+    /// splice it into a &lt;style&gt;/&lt;script&gt; tag. Keeps the source split across
+    /// files while still shipping a single embedded payload.
+    /// </summary>
     private static string LoadHtml()
     {
+        var html = ReadAsset("dashboard.html");
+        if (html is null) return "<html><body style='font-family:sans-serif'>dashboard.html não encontrado.</body></html>";
+
+        // Inline <link rel="stylesheet" href="X"> -> <style>...</style>
+        html = Regex.Replace(html,
+            "<link[^>]*?href=\"([^\"]+\\.css)\"[^>]*?>",
+            m => $"<style>\n{ReadAsset(m.Groups[1].Value) ?? "/* " + m.Groups[1].Value + " não encontrado */"}\n</style>",
+            RegexOptions.IgnoreCase);
+
+        // Inline <script src="Y"></script> -> <script>...</script>
+        html = Regex.Replace(html,
+            "<script[^>]*?src=\"([^\"]+\\.js)\"[^>]*?>\\s*</script>",
+            m => $"<script>\n{ReadAsset(m.Groups[1].Value) ?? "/* " + m.Groups[1].Value + " não encontrado */"}\n</script>",
+            RegexOptions.IgnoreCase);
+
+        return html;
+    }
+
+    /// <summary>
+    /// Reads an embedded asset by its file name (ignoring the path in the href/src,
+    /// e.g. "js/core.js" matches resource "...Assets.js.core.js"). Returns null if absent.
+    /// </summary>
+    private static string? ReadAsset(string reference)
+    {
+        var fileName = reference.Replace('\\', '/').Split('/').Last();
         var asm = Assembly.GetExecutingAssembly();
         var name = asm.GetManifestResourceNames()
-            .FirstOrDefault(n => n.EndsWith("dashboard.html", StringComparison.OrdinalIgnoreCase));
-        if (name is null) return "<html><body style='font-family:sans-serif'>dashboard.html não encontrado.</body></html>";
+            .FirstOrDefault(n => n.EndsWith("." + fileName, StringComparison.OrdinalIgnoreCase)
+                              || n.EndsWith(fileName, StringComparison.OrdinalIgnoreCase));
+        if (name is null) return null;
         using var stream = asm.GetManifestResourceStream(name)!;
         using var reader = new StreamReader(stream, Encoding.UTF8);
         return reader.ReadToEnd();
