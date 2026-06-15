@@ -36,13 +36,20 @@ O script publica `SecAgent.Service` e `SecAgent.Tray` com
 
 ## O que o instalador faz (em runtime, como admin/UAC)
 
+0. **`PrepareToInstall` (antes de copiar [Files])**: para o serviço
+   (`sc stop` + espera `STOPPED` via `WaitServiceStopped`) e mata o Tray
+   (`taskkill /im SecAgent.Tray.exe /f /t`). Sem isso, `SecAgent.Service.exe`
+   (travado pelo serviço LocalSystem, que roda em qualquer login) e
+   `SecAgent.Tray.exe` ficam locked e a sobrescrita falha com "acesso negado"
+   — clássico ao reinstalar por outro login do Windows.
 1. Copia `publish\Service\*` → `{app}\Service` e `publish\Tray\*` → `{app}\Tray`
    (`{app}` = `C:\Program Files\SecAgent`).
 2. **Página custom de Claude** (`CreateCustomPage` após a seleção de diretório):
    - Detecta o `claude.exe` (`%USERPROFILE%\.local\bin\claude.exe`, depois PATH)
      com campo editável + botão Procurar.
-   - Token: **colar** existente (valida prefixo `sk-ant-oat`), **gerar** via
-     `claude setup-token`, ou **pular**.
+   - Token: **colar** existente (valida prefixo `sk-ant-oat`), **gerar** (botão
+     "Abrir terminal" → `claude setup-token` num terminal real/interativo, o
+     usuário cola o token impresso no campo), ou **pular**.
 3. Pós-install (`CurStepChanged(ssPostInstall)`):
    - **Patcha** `Claude.ExePath` no `{app}\Service\appsettings.json` com o
      caminho detectado (substitui o default `C:\Users\adria\.local\bin\...`).
@@ -58,10 +65,16 @@ O script publica `SecAgent.Service` e `SecAgent.Tray` com
 
 ## Gotchas / caveats
 
-1. **Captura do `setup-token`**: o `.iss` redireciona o stdout do
-   `claude setup-token` para um arquivo temp e extrai `sk-ant-oat...` com
-   `ExtractToken`. Se o CLI mudar o formato de saída, a extração quebra — o
-   fallback confiável é a opção "colar token".
+1. **Geração do `setup-token`**: o botão "Abrir terminal" roda
+   `claude setup-token` num terminal **real e interativo** via
+   `ExecAsOriginalUser` (`cmd /k`, sem redirecionar saída) — DESelevado, no
+   contexto do usuário logado (`%USERPROFILE%`/PATH/navegador/credenciais
+   corretos). O usuário copia o `sk-ant-oat...` impresso e cola no campo; a
+   validação (prefixo) é a mesma do "colar token". **Não** há mais scrape de
+   stdout (a versão antiga redirecionava p/ arquivo → terminal preto, sem TTY,
+   e o claude não exibia o fluxo). Requer **Inno Setup 6.1+** (por causa de
+   `ExecAsOriginalUser`); fallback seria `Exec` com `cmd /k` (visível, mas
+   elevado).
 2. **`claude.exe` + LocalSystem**: o serviço roda como LocalSystem, então o
    `ExePath` patchado precisa ser um caminho absoluto legível/executável por
    ele. Um `claude.exe` em `C:\Users\<user>\.local\bin` funciona; mover ou
