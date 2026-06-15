@@ -361,3 +361,7 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# SecAgent.Installer - artefatos gerados (binarios publicados + setup.exe)
+SecAgent.Installer/publish/
+SecAgent.Installer/output/

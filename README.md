@@ -261,7 +261,35 @@ em torno do `Clear()`.
 
 ## Instalação
 
-### 1. Autenticar o Claude Code
+Há dois caminhos: o **instalador gráfico** (recomendado para máquina limpa) ou
+a **instalação manual** via scripts (abaixo, melhor para a máquina de
+desenvolvimento que tem o repo + .NET SDK).
+
+### Opção A — Instalador (`SecAgent-Setup.exe`)
+
+O projeto `SecAgent.Installer\` gera um instalador único (Inno Setup) que
+empacota Service + Tray **self-contained** (não precisa de .NET na máquina
+alvo), registra o serviço, configura o token do Claude e o autostart do Tray.
+
+```powershell
+# Na máquina de build (precisa .NET 8 SDK + Inno Setup 6):
+#   winget install JRSoftware.InnoSetup
+powershell -ExecutionPolicy Bypass -File C:\Projetos\SecAgent\SecAgent.Installer\build-installer.ps1
+# -> SecAgent.Installer\output\SecAgent-Setup.exe
+```
+
+Rode o `SecAgent-Setup.exe` (pede UAC). No wizard, a página **Claude Code**
+detecta o `claude.exe` e deixa você **colar** um token existente, **gerar** um
+na hora (`claude setup-token`) ou **pular**. Detalhes e caveats em
+`SecAgent.Installer\CLAUDE.md`.
+
+> Mesmo usando o instalador, o token precisa ser gerado via `claude setup-token`
+> (auth OAuth interativa no browser) — o instalador apenas o captura/grava em
+> Machine scope. Se escolher "pular", configure depois (Opção B, passos 1–2).
+
+### Opção B — Instalação manual (scripts)
+
+#### 1. Autenticar o Claude Code
 
 Em um PowerShell normal (sua sessão de usuário):
 ```powershell
@@ -270,7 +298,7 @@ claude setup-token
 Isso abre o navegador, você autoriza, e o CLI imprime um token long-lived
 (`sk-ant-oat01-...`).
 
-### 2. Salvar o token como env var
+#### 2. Salvar o token como env var
 
 Em **PowerShell Administrador**:
 ```powershell
@@ -284,7 +312,7 @@ roda como LocalSystem).
 > Para o serviço, pode usar o mesmo script — o que importa é a env var
 > `CLAUDE_CODE_OAUTH_TOKEN` estar setada em scope Machine.
 
-### 3. Deployar o serviço (publish + install em uma só passada)
+#### 3. Deployar o serviço (publish + install em uma só passada)
 
 Em **PowerShell Administrador** — o script para o serviço (se já existir),
 publica o binário, re-registra e inicia:
@@ -307,7 +335,7 @@ A primeira análise roda imediatamente (~1 min de scan + ~1 min de análise Clau
 > alternativa: `install-service.ps1` — assume que `bin\publish` já foi gerado.
 > O `deploy.ps1` é o caminho universal para qualquer update.
 
-### 4. Instalar o Tray (sem admin)
+#### 4. Instalar o Tray (sem admin)
 
 Em **PowerShell normal** (sessão do seu usuário):
 ```powershell
@@ -323,7 +351,7 @@ O script:
 
 Procure o ícone do SecAgent na bandeja (próximo ao relógio).
 
-### 5. Verificar
+#### 5. Verificar
 
 ```powershell
 Get-Service SecAgent                                # Status=Running
