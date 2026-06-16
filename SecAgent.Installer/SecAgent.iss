@@ -48,13 +48,26 @@ Source: "publish\Service\*"; DestDir: "{app}\Service"; Flags: ignoreversion recu
 Source: "publish\Tray\*";    DestDir: "{app}\Tray";    Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Registry]
-; Autostart do Tray para o usuario que rodou o setup (HKCU).
-; Caveat: com UAC same-user, HKCU continua sendo a hive do usuario -> OK em
-; maquina pessoal. Se um admin DIFERENTE instalar, cai na hive errada.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
+; Autostart do Tray para TODOS os usuarios (HKLM) - padrao de mercado para
+; "servico LocalSystem machine-wide + UI por usuario". Cada usuario que logar
+; recebe o Tray. Quem quiser remover so a sua copia (sem admin) usa o menu
+; "Remover SecAgent deste usuario", que grava um opt-out em HKCU\Software\
+; SecAgent (honrado pelo Tray no startup). uninsdeletevalue remove no uninstall.
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueType: string; ValueName: "{#TrayRunValue}"; \
     ValueData: """{app}\Tray\SecAgent.Tray.exe"""; \
     Flags: uninsdeletevalue
+
+; Migracao: instalacoes antigas gravavam o autostart em HKCU\...\Run do usuario
+; que rodou o setup. Remove esse valor legado para o Tray nao subir duas vezes
+; (uma pelo HKLM, outra pelo HKCU obsoleto).
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
+    ValueName: "{#TrayRunValue}"; Flags: deletevalue
+
+; Reabilita o Tray para o usuario que roda o setup (limpa um opt-out anterior),
+; tratando reinstalacao/reparo como "voltar ao padrao".
+Root: HKCU; Subkey: "Software\SecAgent"; \
+    ValueName: "TrayDisabled"; Flags: deletevalue
 
 [Run]
 ; Inicia o Tray como o usuario (nao elevado) ao final.
@@ -412,7 +425,8 @@ begin
   InstallService();
 end;
 
-{ ----- Desinstalacao: parar/remover servico e Tray (preserva ProgramData + token) ----- }
+{ ----- Desinstalacao COMPLETA (admin, todos os usuarios): parar/remover servico,
+        Tray e autostart HKLM. Pergunta se tambem limpa ProgramData + token. ----- }
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
@@ -420,8 +434,23 @@ var
 begin
   if CurUninstallStep <> usUninstall then exit;
 
+  { 1) Servico (machine-wide) + Tray de qualquer sessao. O autostart HKLM e a
+       chave HKCU legada saem via uninsdeletevalue/[Registry]. }
   Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#ServiceName}', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\sc.exe'), 'delete {#ServiceName}', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/im SecAgent.Tray.exe /f', '', SW_HIDE, ewWaitUntilTerminated, Code);
-  { ProgramData (historico) e CLAUDE_CODE_OAUTH_TOKEN sao preservados de proposito. }
+
+  { 2) Limpeza opcional dos dados. Default = preservar (Nao), para uma futura
+       reinstalacao reaproveitar historico/token. }
+  if MsgBox('Remover tambem o historico de scans/eventos (C:\ProgramData\SecAgent) '
+            + 'e o token do Claude (CLAUDE_CODE_OAUTH_TOKEN, Machine scope)?'#13#10#13#10
+            + 'Sim = limpeza completa.'#13#10
+            + 'Nao = preserva os dados para uma futura reinstalacao.',
+            mbConfirmation, MB_YESNO) = IDYES then
+  begin
+    DelTree(ExpandConstant('{commonappdata}\SecAgent'), True, True, True);
+    Exec(ExpandConstant('{sys}\reg.exe'),
+         'delete "HKLM\' + EnvKey + '" /v ' + TokenVar + ' /f',
+         '', SW_HIDE, ewWaitUntilTerminated, Code);
+  end;
 end;

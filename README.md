@@ -287,6 +287,18 @@ na hora (`claude setup-token`) ou **pular**. Detalhes e caveats em
 > (auth OAuth interativa no browser) — o instalador apenas o captura/grava em
 > Machine scope. Se escolher "pular", configure depois (Opção B, passos 1–2).
 
+O autostart do Tray é registrado em `HKLM\...\Run`, então **todos os usuários**
+da máquina recebem o ícone ao logar (padrão de mercado para serviço machine-wide
++ UI por usuário).
+
+**Desinstalar:**
+- **Completo (todos os usuários, requer admin):** "Aplicativos e recursos" do
+  Windows → SecAgent → Desinstalar. Remove serviço + binários + autostart e
+  **pergunta** se também apaga o histórico (`C:\ProgramData\SecAgent`) e o token.
+- **Só da minha conta (sem admin):** menu do Tray → "Remover SecAgent deste
+  usuário". Tira o ícone e o autostart apenas do login atual; o serviço de
+  monitoramento da máquina continua.
+
 ### Opção B — Instalação manual (scripts)
 
 #### 1. Autenticar o Claude Code
