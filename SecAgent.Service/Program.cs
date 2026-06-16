@@ -5,6 +5,7 @@ using SecAgent.Service.Analysis;
 using SecAgent.Service.Collectors;
 using SecAgent.Service.Models;
 using SecAgent.Service.Monitors;
+using SecAgent.Service.Remediation;
 using SecAgent.Service.Triggers;
 
 var builder = Host.CreateApplicationBuilder(args);
@@ -28,6 +29,7 @@ builder.Services.AddSingleton<StatusFileService>();
 builder.Services.AddSingleton<ProgressTracker>();
 builder.Services.AddSingleton<ClaudeAnalyzer>();
 builder.Services.AddSingleton<ScanRunner>();
+builder.Services.AddSingleton<IpBlocker>();
 builder.Services.AddHostedService<Worker>();
 
 // Phase 4.1: manual trigger via tray

@@ -1,15 +1,19 @@
+using System.Net;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using Microsoft.Extensions.Options;
+using SecAgent.Service.Remediation;
 
 namespace SecAgent.Service.Triggers;
 
 /// <summary>
 /// Watches C:\ProgramData\SecAgent\triggers for *.trigger files written by the
 /// SecAgent.Tray app (user-mode, cannot talk to the service directly).
-/// Two known triggers:
+/// Known triggers:
 ///   scan-only.trigger         -> ScanRunner.RunScanOnlyAsync
 ///   scan-and-analyze.trigger  -> ScanRunner.RunScanAndAnalyzeAsync
+///   block-ip-&lt;ip&gt;.trigger     -> IpBlocker.Block   (IP read from file content)
+///   unblock-ip-&lt;ip&gt;.trigger   -> IpBlocker.Unblock (IP read from file content)
 /// Trigger file is always deleted after processing (success OR error).
 /// Triggers written while the service was down are drained on startup.
 /// </summary>
@@ -17,18 +21,22 @@ public class TriggerWatcher : BackgroundService
 {
     private const string ScanOnlyTrigger = "scan-only.trigger";
     private const string ScanAndAnalyzeTrigger = "scan-and-analyze.trigger";
+    private const string BlockIpPrefix = "block-ip-";
+    private const string UnblockIpPrefix = "unblock-ip-";
 
     private readonly ILogger<TriggerWatcher> _logger;
     private readonly ScanRunner _runner;
+    private readonly IpBlocker _blocker;
     private readonly TriggerOptions _opts;
     private readonly Dictionary<string, DateTime> _lastFiredUtc = new();
     private readonly object _lock = new();
     private FileSystemWatcher? _watcher;
 
-    public TriggerWatcher(ILogger<TriggerWatcher> logger, ScanRunner runner, IOptions<TriggerOptions> opts)
+    public TriggerWatcher(ILogger<TriggerWatcher> logger, ScanRunner runner, IpBlocker blocker, IOptions<TriggerOptions> opts)
     {
         _logger = logger;
         _runner = runner;
+        _blocker = blocker;
         _opts = opts.Value;
     }
 
@@ -89,17 +97,32 @@ public class TriggerWatcher : BackgroundService
         _logger.LogInformation("Trigger {Name} accepted", name);
         try
         {
-            switch (name)
+            if (name.StartsWith(BlockIpPrefix, StringComparison.Ordinal) ||
+                name.StartsWith(UnblockIpPrefix, StringComparison.Ordinal))
             {
-                case ScanOnlyTrigger:
-                    await _runner.RunScanOnlyAsync("tray", ct);
-                    break;
-                case ScanAndAnalyzeTrigger:
-                    await _runner.RunScanAndAnalyzeAsync("tray", ct);
-                    break;
-                default:
-                    _logger.LogWarning("Unknown trigger file: {Name}", name);
-                    break;
+                // The IP travels in the file CONTENT (filenames can't hold IPv6 ':').
+                var ip = ReadIpPayload(fullPath);
+                if (ip is null)
+                    _logger.LogWarning("Trigger {Name} has no valid IP payload", name);
+                else if (name.StartsWith(BlockIpPrefix, StringComparison.Ordinal))
+                    _blocker.Block(ip);
+                else
+                    _blocker.Unblock(ip);
+            }
+            else
+            {
+                switch (name)
+                {
+                    case ScanOnlyTrigger:
+                        await _runner.RunScanOnlyAsync("tray", ct);
+                        break;
+                    case ScanAndAnalyzeTrigger:
+                        await _runner.RunScanAndAnalyzeAsync("tray", ct);
+                        break;
+                    default:
+                        _logger.LogWarning("Unknown trigger file: {Name}", name);
+                        break;
+                }
             }
         }
         catch (Exception ex)
@@ -115,6 +138,17 @@ public class TriggerWatcher : BackgroundService
     private static void TryDelete(string path)
     {
         try { if (File.Exists(path)) File.Delete(path); } catch { }
+    }
+
+    /// <summary>Reads the IP written as the trigger's content; null if missing/invalid.</summary>
+    private static string? ReadIpPayload(string path)
+    {
+        try
+        {
+            var content = File.ReadAllText(path).Trim();
+            return IPAddress.TryParse(content, out var ip) ? ip.ToString() : null;
+        }
+        catch { return null; }
     }
 
     /// <summary>

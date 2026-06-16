@@ -146,7 +146,7 @@ public class TrayApplicationContext : ApplicationContext
         return menu;
     }
 
-    private void RequestTrigger(string fileName, string okMessage)
+    private void RequestTrigger(string fileName, string okMessage, string? content = null)
     {
         if (_lastTriggerClickUtc.TryGetValue(fileName, out var last) &&
             DateTime.UtcNow - last < TimeSpan.FromSeconds(TriggerDebounceSeconds))
@@ -161,7 +161,7 @@ public class TrayApplicationContext : ApplicationContext
         {
             Directory.CreateDirectory(TriggersDir);
             var path = Path.Combine(TriggersDir, fileName);
-            File.WriteAllText(path, DateTime.UtcNow.ToString("o"));
+            File.WriteAllText(path, content ?? DateTime.UtcNow.ToString("o"));
             _lastTriggerClickUtc[fileName] = DateTime.UtcNow;
             _icon.ShowBalloonTip(4000, "SecAgent", okMessage, ToolTipIcon.Info);
         }
@@ -210,12 +210,31 @@ public class TrayApplicationContext : ApplicationContext
         {
             case "scanOnly":
                 RequestTrigger(ScanOnlyTrigger, "Varredura iniciada, aguarde ~5s...");
-                break;
+                return;
             case "scanAndAnalyze":
                 RequestTrigger(ScanAndAnalyzeTrigger, "Varredura + análise iniciadas, aguarde ~1-2 min...");
-                break;
+                return;
+        }
+
+        if (cmd.StartsWith("blockIp:", StringComparison.Ordinal))
+        {
+            var ip = cmd.Substring("blockIp:".Length).Trim();
+            RequestTrigger($"block-ip-{SanitizeIp(ip)}.trigger",
+                $"Bloqueando {ip} (entrada e saída)…", ip);
+        }
+        else if (cmd.StartsWith("unblockIp:", StringComparison.Ordinal))
+        {
+            var ip = cmd.Substring("unblockIp:".Length).Trim();
+            RequestTrigger($"unblock-ip-{SanitizeIp(ip)}.trigger",
+                $"Desbloqueando {ip}…", ip);
         }
     }
+
+    // IPv6 addresses carry ':' / '%', which are illegal in Windows filenames.
+    // The sanitized form is only for the trigger NAME; the raw IP rides in the
+    // file content (the Service parses/validates that).
+    private static string SanitizeIp(string ip)
+        => ip.Replace(':', '-').Replace('%', '-').Replace('/', '-');
 
     private void RefreshStatus()
     {

@@ -58,5 +58,6 @@ window.chrome.webview.addEventListener('message', e => {
     case 'events':   onEvents(m.payload); break;
     case 'network':  onNetwork(m.payload); break;
     case 'geo':      onGeo(m.payload); break;
+    case 'blocked':  onBlocked(m.payload); break;
   }
 });
