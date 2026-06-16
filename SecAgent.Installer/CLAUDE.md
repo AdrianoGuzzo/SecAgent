@@ -58,10 +58,21 @@ O script publica `SecAgent.Service` e `SecAgent.Tray` com
    - Registra o serviço: `sc.exe create SecAgent ... obj= LocalSystem` +
      `description` + `failure` (mesmos parâmetros do `SecAgent.Service\deploy.ps1`)
      e dá `sc start`.
-   - Autostart do Tray: `HKCU\...\Run\SecAgentTray` (via `[Registry]`).
+   - Autostart do Tray: `HKLM\...\Run\SecAgentTray` (via `[Registry]`) — vale
+     para **todos os usuários** (padrão de mercado p/ serviço machine-wide + UI
+     por usuário). Também limpa o valor legado em `HKCU\...\Run` (instalações
+     antigas) e zera o opt-out `HKCU\Software\SecAgent\TrayDisabled` do usuário
+     que roda o setup (reinstalar = "voltar ao padrão").
    - Inicia o Tray como usuário (`[Run]` com `runasoriginaluser`).
-4. Uninstall (`CurUninstallStepChanged`): para+deleta o serviço, mata o Tray,
-   remove o autostart. **Preserva** `C:\ProgramData\SecAgent\` e o token.
+4. **Uninstall completo** (`CurUninstallStepChanged`, admin, todos os usuários):
+   para+deleta o serviço, mata o Tray, remove o autostart HKLM (via
+   `uninsdeletevalue`). **Pergunta** se também remove `C:\ProgramData\SecAgent\`
+   (histórico) + o token Machine scope; default = preservar (Não).
+5. **Remoção por usuário** (sem admin): NÃO é o desinstalador do Inno — é o item
+   de menu "Remover SecAgent deste usuário" no Tray, que grava
+   `HKCU\Software\SecAgent\TrayDisabled=1` (honrado pelo Tray no startup) e mata
+   só a cópia do login atual. O serviço machine-wide continua. Ver
+   `SecAgent.Tray\UserInstall.cs`.
 
 ## Gotchas / caveats
 
@@ -79,9 +90,11 @@ O script publica `SecAgent.Service` e `SecAgent.Tray` com
    `ExePath` patchado precisa ser um caminho absoluto legível/executável por
    ele. Um `claude.exe` em `C:\Users\<user>\.local\bin` funciona; mover ou
    desinstalar o CLI quebra a análise (`File.Exists` falha em `ClaudeAnalyzer`).
-3. **HKCU sob install elevado**: com UAC same-user, `HKCU` continua sendo a hive
-   do usuário → autostart correto em máquina pessoal. Se um admin *diferente*
-   instalar, o autostart cai na hive errada.
+3. **Autostart em HKLM (não HKCU)**: o `[Registry]` grava o Run em
+   `HKLM\...\Run`, então o Tray sobe para **qualquer** usuário que logar —
+   imune a "instalou com admin diferente do usuário final". A escolha por
+   usuário fica no opt-out `HKCU\Software\SecAgent\TrayDisabled` (item de menu
+   do Tray), não na presença/ausência da chave de autostart.
 4. **`GetEnv('USERPROFILE')`**: idem — reflete o usuário do processo de setup.
    Em elevação same-user é o esperado.
 5. **WebView2 Runtime**: o Tray usa WebView2 (Evergreen). Win11 já traz; Win10
