@@ -74,7 +74,6 @@ public sealed class DataPump : IDisposable
         TryWatch(ref _eventsWatcher, EventsDir, "events_*.jsonl", (_, _) => ReadNewEvents(), null);
 
         _timer.Start();
-        RequestInitialSnapshot();
     }
 
     public void Stop()

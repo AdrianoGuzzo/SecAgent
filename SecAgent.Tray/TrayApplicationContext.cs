@@ -199,7 +199,7 @@ public class TrayApplicationContext : ApplicationContext
             _dataPump = null;
             _dashboard = null;
         };
-        _dataPump.Start();          // emits initial snapshot (buffered until page ready)
+        _dataPump.Start();
         _dashboard.Show();
         _dashboard.Activate();
     }

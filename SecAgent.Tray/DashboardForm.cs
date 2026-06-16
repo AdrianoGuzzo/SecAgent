@@ -82,6 +82,7 @@ public sealed class DashboardForm : Form
             {
                 _ready = true;
                 FlushPending();
+                _pump.RequestInitialSnapshot();
             };
 
             _web.CoreWebView2.NavigateToString(LoadHtml());
