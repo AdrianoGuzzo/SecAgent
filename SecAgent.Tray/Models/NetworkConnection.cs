@@ -17,5 +17,6 @@ public record NetworkConnection(
     int RemotePort,
     string ProcessName,
     int Pid,
-    bool RemoteIsPublic
+    bool RemoteIsPublic,
+    long BytesPerSec = 0     // current throughput (in+out) for this connection
 );
