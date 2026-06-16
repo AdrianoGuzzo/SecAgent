@@ -20,5 +20,6 @@ public record NetworkConnection(
     int RemotePort,
     string ProcessName,
     int Pid,
-    bool RemoteIsPublic      // true when RemoteAddress is a routable public IP
+    bool RemoteIsPublic,     // true when RemoteAddress is a routable public IP
+    long BytesPerSec = 0     // current throughput (in+out) for this connection, bytes/s
 );
