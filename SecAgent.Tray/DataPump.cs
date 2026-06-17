@@ -100,8 +100,19 @@ public sealed class DataPump : IDisposable
         EmitLatestIncident();
         EmitNetwork();
         EmitBlocked();
+        EmitTokenStatus();
         PreloadEvents();
     }
+
+    /// <summary>
+    /// Emits whether the Claude OAuth token is configured, so the page can show the
+    /// AI button or the "Configurar IA" wrench. Sourced from the env var (not a
+    /// Service file), so it's computed here in the host. Public so the form can
+    /// refresh the page immediately after the token is saved.
+    /// </summary>
+    public void EmitTokenStatus()
+        => Message?.Invoke("tokenStatus",
+            "{\"configured\":" + (TokenSetup.IsConfigured() ? "true" : "false") + "}");
 
     // ---- emitters -----------------------------------------------------------
 
@@ -294,6 +305,7 @@ public sealed class DataPump : IDisposable
         EmitProgress();
         EmitNetwork();
         EmitBlocked();
+        EmitTokenStatus();
         ReadNewEvents();
     }
 

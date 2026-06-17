@@ -24,6 +24,18 @@ function onStatus(s) {
   }
 }
 
+// ---- token status (botão de IA vs. configurar) ----
+function onTokenStatus(p) {
+  const configured = !!(p && p.configured);
+  const analyze = document.getElementById('btnAnalyze');
+  const config = document.getElementById('btnConfigAI');
+  if (analyze) {
+    analyze.style.display = configured ? '' : 'none';
+    analyze.disabled = !configured;
+  }
+  if (config) config.style.display = configured ? 'none' : '';
+}
+
 // ---- progress ----
 function onProgress(p) {
   const box = document.getElementById('progress');
