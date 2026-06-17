@@ -37,6 +37,14 @@ class Format {
     try { return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
     catch (e) { return ''; }
   }
+
+  // bytes/s -> texto amigável (—, KB/s, MB/s) com locale pt-BR. Usado tanto na
+  // coluna de tráfego por conexão quanto no total agregado por interface.
+  static rate(bps) {
+    if (!bps || bps < 1024) return '—';
+    if (bps < 1024 * 1024) return (bps / 1024).toLocaleString('pt-BR', { maximumFractionDigits: 0 }) + ' KB/s';
+    return (bps / (1024 * 1024)).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' MB/s';
+  }
 }
 
 // ---- ponte com o host C# (WebView2) ----

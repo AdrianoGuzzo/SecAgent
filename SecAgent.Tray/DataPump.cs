@@ -337,6 +337,11 @@ public sealed class DataPump : IDisposable
             };
             w.Created += onChanged;
             w.Changed += onChanged;
+            // O Service grava por escrita atômica (File.Move com overwrite), que no
+            // Windows chega como Renamed — não Created/Changed. Sem assinar isto, todo
+            // update após o primeiro era perdido e o painel só atualizava pelo PollLight
+            // (3s). RenamedEventArgs deriva de FileSystemEventArgs, então repassa direto.
+            w.Renamed += (s, e) => onChanged(s, e);
             if (onDeleted is not null) w.Deleted += onDeleted;
             watcher = w;
         }

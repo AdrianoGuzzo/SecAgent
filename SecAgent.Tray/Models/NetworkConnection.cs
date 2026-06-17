@@ -6,7 +6,8 @@ namespace SecAgent.Tray.Models;
 
 public record NetworkSnapshot(
     DateTime GeneratedAtUtc,
-    List<NetworkConnection> Connections
+    List<NetworkConnection> Connections,
+    List<NetworkInterfaceStat>? Interfaces = null
 );
 
 public record NetworkConnection(
@@ -19,4 +20,10 @@ public record NetworkConnection(
     int Pid,
     bool RemoteIsPublic,
     long BytesPerSec = 0     // current throughput (in+out) for this connection
+);
+
+public record NetworkInterfaceStat(
+    string Name,            // nome amigável da NIC (ex.: "Wi-Fi")
+    long BytesDownPerSec,   // recebido, bytes/s
+    long BytesUpPerSec      // enviado, bytes/s
 );

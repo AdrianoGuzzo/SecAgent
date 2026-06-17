@@ -31,6 +31,8 @@ class ConexoesPanel {
   onNetwork(snap) {
     this._lastNetwork = snap;
     this._renderConns();
+    // Atualiza o widget de tráfego total (card no Resumo + chip aqui).
+    SecAgent.trafego?.render(snap.interfaces || []);
   }
 
   onGeo(g) {
@@ -85,13 +87,6 @@ class ConexoesPanel {
   }
 
   // ---- formatação de tráfego ----
-  // Formata bytes/s em texto amigável (—, KB/s, MB/s) com locale pt-BR.
-  _fmtRate(bps) {
-    if (!bps || bps < 1024) return '—';
-    if (bps < 1024 * 1024) return (bps / 1024).toLocaleString('pt-BR', { maximumFractionDigits: 0 }) + ' KB/s';
-    return (bps / (1024 * 1024)).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' MB/s';
-  }
-
   _rateLevel(bps) {
     if (bps >= ConexoesPanel.RATE_HIGH) return 'high';
     if (bps >= ConexoesPanel.RATE_MID) return 'mid';
@@ -120,7 +115,7 @@ class ConexoesPanel {
     return {
       inbound, remoteIsPublic: c.remoteIsPublic,
       localHtml, ispHtml,
-      rateText: this._fmtRate(bps), rateLevel: this._rateLevel(bps),
+      rateText: Format.rate(bps), rateLevel: this._rateLevel(bps),
       sort: {
         dir: inbound ? 0 : 1,
         process: c.processName || '',

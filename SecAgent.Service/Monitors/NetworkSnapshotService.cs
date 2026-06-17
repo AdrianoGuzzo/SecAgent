@@ -42,6 +42,17 @@ public class NetworkSnapshotService : BackgroundService
     private Dictionary<string, ulong> _prevBytes = new();
     private DateTime _lastCycleUtc;
 
+    // Per-interface cumulative byte counters from the previous cycle, keyed by
+    // NetworkInterface.Id, so we can derive real per-NIC throughput by diffing.
+    private Dictionary<string, (ulong rx, ulong tx)> _prevIfaceBytes = new();
+
+    // Adaptadores virtuais a ignorar (queremos só Wi-Fi/Ethernet físicas reais).
+    private static readonly string[] VirtualNicFragments =
+    {
+        "virtual", "vmware", "hyper-v", "vethernet", "vpn", "tap",
+        "loopback", "pseudo", "bluetooth", "miniport", "npcap"
+    };
+
     public NetworkSnapshotService(
         ILogger<NetworkSnapshotService> logger,
         Channel<SecurityEvent> channel,
@@ -139,10 +150,73 @@ public class NetworkSnapshotService : BackgroundService
             }
         }
 
+        var interfaces = BuildInterfaceStats(elapsed);
+
         _prevBytes = nextBytes;        // drop connections that vanished — no leak
         _lastCycleUtc = now;
         _seenInbound = currentInbound;
-        WriteSnapshotAtomic(new NetworkSnapshot(now, connections));
+        WriteSnapshotAtomic(new NetworkSnapshot(now, connections, interfaces));
+    }
+
+    /// <summary>
+    /// Lê os contadores reais de bytes (recebido/enviado) de cada interface física
+    /// ativa e deriva a taxa atual (bytes/s) diferenciando vs. o ciclo anterior —
+    /// mesmo padrão de <see cref="_prevBytes"/>. Diferente do ESTATS por conexão,
+    /// isto reflete TODO o tráfego da NIC (cabeçalhos, UDP, ICMP, etc.).
+    /// </summary>
+    private List<NetworkInterfaceStat>? BuildInterfaceStats(double elapsed)
+    {
+        if (!_opts.InterfaceStatsEnabled) return null;
+
+        var stats = new List<NetworkInterfaceStat>();
+        var nextIfaceBytes = new Dictionary<string, (ulong rx, ulong tx)>();
+
+        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!IsPhysicalUp(ni)) continue;
+
+            ulong cumRx, cumTx;
+            try
+            {
+                var s = ni.GetIPv4Statistics();     // lança se a NIC não tem IPv4
+                cumRx = (ulong)s.BytesReceived;
+                cumTx = (ulong)s.BytesSent;
+            }
+            catch { continue; }
+
+            nextIfaceBytes[ni.Id] = (cumRx, cumTx);
+
+            long down = 0, up = 0;
+            if (elapsed > 0 && _prevIfaceBytes.TryGetValue(ni.Id, out var prev))
+            {
+                if (cumRx >= prev.rx) down = (long)((cumRx - prev.rx) / elapsed);
+                if (cumTx >= prev.tx) up = (long)((cumTx - prev.tx) / elapsed);
+            }
+
+            stats.Add(new NetworkInterfaceStat(ni.Name, down, up));
+        }
+
+        _prevIfaceBytes = nextIfaceBytes;     // descarta NICs que sumiram — sem leak
+        return stats;
+    }
+
+    // Só interfaces físicas reais (Wi-Fi/Ethernet) ativas: exclui loopback/túnel
+    // e adaptadores virtuais (VPN, Hyper-V, VMware, Bluetooth, etc.).
+    private static bool IsPhysicalUp(NetworkInterface ni)
+    {
+        if (ni.OperationalStatus != OperationalStatus.Up) return false;
+        if (ni.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
+            return false;
+        if (ni.NetworkInterfaceType is not (NetworkInterfaceType.Ethernet
+            or NetworkInterfaceType.GigabitEthernet
+            or NetworkInterfaceType.Wireless80211))
+            return false;
+
+        var hay = (ni.Description + " " + ni.Name);
+        foreach (var frag in VirtualNicFragments)
+            if (hay.Contains(frag, StringComparison.OrdinalIgnoreCase))
+                return false;
+        return true;
     }
 
     private void MaybeEmitInbound(string key, IpHlpApi.TcpConnectionRow r, string procName)

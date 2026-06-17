@@ -45,6 +45,11 @@
 
   <main>
     <section id="resumo" class="tab active">
+      <div id="trafficCard" class="traffic-card" title="">
+        <span class="traffic-card-label">Tráfego de rede agora</span>
+        <span id="trafficTotalResumo" class="traffic-card-value">—</span>
+        <span class="traffic-card-hint">passe o mouse para ver cada interface</span>
+      </div>
       <div id="summaryBox" class="summary" style="display:none">
         <h3>Resumo da última análise</h3>
         <div id="summaryText"></div>
@@ -62,6 +67,9 @@
         A coluna <b>Tráfego</b> mostra a velocidade atual de cada conexão
         (<span class="rate rate-mid">amarelo</span> = médio, <span class="rate rate-high">vermelho</span> = alto).
         Clique num cabeçalho para ordenar.
+      </div>
+      <div class="traffic-bar">
+        <span id="trafficTotalConex" class="traffic-chip" title="">Tráfego total —</span>
       </div>
       <table>
         <thead><tr>
@@ -95,6 +103,7 @@
   <script src="js/core.js"></script>
   <script src="js/analyze.js"></script>
   <script src="js/resumo.js"></script>
+  <script src="js/trafego.js"></script>
   <script src="js/conexoes.js"></script>
   <script src="js/eventos.js"></script>
 </body>
