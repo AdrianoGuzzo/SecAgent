@@ -21,6 +21,7 @@ public sealed class DataPump : IDisposable
     private const string StatusPath = @"C:\ProgramData\SecAgent\status.json";
     private const string ProgressPath = @"C:\ProgramData\SecAgent\progress.json";
     private const string NetworkPath = @"C:\ProgramData\SecAgent\network.json";
+    private const string BlockedPath = @"C:\ProgramData\SecAgent\blocked.json";
     private const string ReportsDir = @"C:\ProgramData\SecAgent\reports";
     private const string EventsDir = @"C:\ProgramData\SecAgent\events";
     private const int PreloadEventLines = 50;
@@ -41,6 +42,7 @@ public sealed class DataPump : IDisposable
     private readonly System.Windows.Forms.Timer _timer;
     private FileSystemWatcher? _progressWatcher;
     private FileSystemWatcher? _networkWatcher;
+    private FileSystemWatcher? _blockedWatcher;
     private FileSystemWatcher? _reportWatcher;
     private FileSystemWatcher? _eventsWatcher;
 
@@ -70,6 +72,7 @@ public sealed class DataPump : IDisposable
 
         TryWatch(ref _progressWatcher, DataDir, "progress.json", OnProgressChanged, OnProgressDeleted);
         TryWatch(ref _networkWatcher, DataDir, "network.json", (_, _) => EmitNetwork(), null);
+        TryWatch(ref _blockedWatcher, DataDir, "blocked.json", (_, _) => EmitBlocked(), null);
         TryWatch(ref _reportWatcher, ReportsDir, "*.json", OnReportChanged, null);
         TryWatch(ref _eventsWatcher, EventsDir, "events_*.jsonl", (_, _) => ReadNewEvents(), null);
 
@@ -83,6 +86,7 @@ public sealed class DataPump : IDisposable
         _timer.Stop();
         DisposeWatcher(ref _progressWatcher);
         DisposeWatcher(ref _networkWatcher);
+        DisposeWatcher(ref _blockedWatcher);
         DisposeWatcher(ref _reportWatcher);
         DisposeWatcher(ref _eventsWatcher);
     }
@@ -95,6 +99,7 @@ public sealed class DataPump : IDisposable
         EmitLatestReport();
         EmitLatestIncident();
         EmitNetwork();
+        EmitBlocked();
         PreloadEvents();
     }
 
@@ -161,6 +166,12 @@ public sealed class DataPump : IDisposable
             if (cached is not null) EmitGeo(ip, cached);
             else _geo.QueueLookup(ip);
         }
+    }
+
+    private void EmitBlocked()
+    {
+        var json = ReadAndCamel<BlockedList>(BlockedPath);
+        if (json is not null) Message?.Invoke("blocked", json);
     }
 
     private void OnGeoResolved(string ip, GeoLookup.GeoInfo info) => EmitGeo(ip, info);
@@ -282,6 +293,7 @@ public sealed class DataPump : IDisposable
         EmitStatus();
         EmitProgress();
         EmitNetwork();
+        EmitBlocked();
         ReadNewEvents();
     }
 

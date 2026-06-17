@@ -4,6 +4,8 @@
 // Caso contrário ordena pela coluna escolhida; dir 1 = asc, -1 = desc.
 let connSort = { key: null, dir: 1 };
 
+// IPs atualmente bloqueados (regras de firewall criadas pelo Service).
+let blockedIps = new Set();
 // Limiares de cor do tráfego (bytes/s). Ajuste aqui se quiser ser mais/menos sensível.
 const RATE_MID = 50 * 1024;          // >= 50 KB/s  => médio (amarelo)
 const RATE_HIGH = 1024 * 1024;       // >= 1 MB/s   => alto  (vermelho)
@@ -29,6 +31,12 @@ function onGeo(g) {
   if (!g || !g.ip) return;
   geoMap[g.ip] = g.geo;
   renderConns();
+}
+function onBlocked(p) {
+  const d = (typeof p === 'string') ? JSON.parse(p) : p;
+  blockedIps = new Set(((d && d.blocked) || []).map(b => b.ip));
+  renderConns();
+  renderBlocked();
 }
 
 // Liga o clique nos cabeçalhos ordenáveis (mesma key alterna direção;
@@ -114,14 +122,58 @@ function renderConns() {
   const rows = sortRows(conns.map(normalizeConn));
 
   tbody.innerHTML = rows.map(r => {
-    return `<tr class="${r.inbound && r.remoteIsPublic ? 'inbound' : ''}">
+    const isBlocked = blockedIps.has(r.remoteAddress);
+    const cls = (r.inbound && r.remoteIsPublic ? 'inbound' : '') + (isBlocked ? ' blocked' : '');
+    const cut = isBlocked
+      ? `<span class="cut blocked" title="IP bloqueado">🚫</span>`
+      : `<button class="cut" data-ip="${esc(r.remoteAddress)}" title="Bloquear este IP (entrada e saída)">✕</button>`;
+    return `<tr class="${cls.trim()}">
       <td class="dir ${r.inbound?'in':'out'}">${r.inbound?'↓ Entrada':'↑ Saída'}</td>
       <td>${esc(r.processName)}</td>
       <td class="rate rate-${r.rateLevel} mono">${r.rateText}</td>
-      <td class="mono">${esc(r.remoteAddress)}</td>
+      <td class="mono">${cut}${esc(r.remoteAddress)}</td>
       <td>${r.localHtml}</td>
       <td>${r.ispHtml}</td>
       <td class="mono">${r.remotePort}</td>
     </tr>`;
   }).join('');
 }
+
+// Segunda tabela "Conexões bloqueadas": IPs com regra de firewall ativa.
+function renderBlocked() {
+  const box = document.getElementById('blockedBox');
+  const tbody = document.getElementById('blockedRows');
+  if (!box || !tbody) return;
+  const ips = [...blockedIps];
+  document.getElementById('blockedBadge').textContent = ips.length;
+  if (!ips.length) { box.style.display = 'none'; tbody.innerHTML = ''; return; }
+  box.style.display = 'block';
+  tbody.innerHTML = ips.map(ip =>
+    `<tr>
+      <td class="mono">${esc(ip)}</td>
+      <td><button class="unblock" data-ip="${esc(ip)}">Desbloquear</button></td>
+    </tr>`).join('');
+}
+
+// Delegação de cliques (registrada uma vez) para bloquear/desbloquear.
+document.getElementById('connRows').addEventListener('click', e => {
+  const btn = e.target.closest('button.cut');
+  if (!btn) return;
+  const ip = btn.dataset.ip;
+  if (!ip) return;
+  if (confirm('Bloquear ' + ip + ' (entrada e saída)?\n\nIsso cria regras no Firewall do Windows. A conexão atual pode levar alguns segundos para cair.')) {
+    blockedIps.add(ip);   // feedback otimista; blocked.json confirma em ~1-2s
+    renderConns();
+    cmd('blockIp:' + ip);
+  }
+});
+document.getElementById('blockedBox').addEventListener('click', e => {
+  const btn = e.target.closest('button.unblock');
+  if (!btn) return;
+  const ip = btn.dataset.ip;
+  if (!ip) return;
+  blockedIps.delete(ip);  // feedback otimista
+  renderConns();
+  renderBlocked();
+  cmd('unblockIp:' + ip);
+});

@@ -109,6 +109,33 @@ tr.inbound { background: rgba(239,68,68,.10); }
 .mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; }
 .muted { color: var(--muted); }
 
+/* Botão discreto de cortar conexão (✕ vermelho à esquerda do IP). */
+.cut {
+  background: transparent; border: none; color: var(--red);
+  font-size: 13px; line-height: 1; cursor: pointer;
+  padding: 0; margin-right: 7px; vertical-align: baseline;
+}
+.cut:hover { color: #fca5a5; }
+.cut.blocked { cursor: default; font-size: 12px; }
+tr.blocked { opacity: .55; }
+tr.blocked .mono { text-decoration: line-through; text-decoration-color: var(--red); }
+
+/* Segunda tabela "Conexões bloqueadas". */
+.blocked-section { margin-top: 28px; }
+.blocked-title {
+  margin: 0 0 10px; font-size: 13px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.blocked-title .badge {
+  background: var(--panel2); border-radius: 10px; padding: 1px 8px;
+  font-size: 12px; margin-left: 6px;
+}
+.unblock {
+  padding: 4px 12px; border-radius: 7px; font-size: 13px;
+  background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+}
+.unblock:hover { background: #334155; }
+
 .feed-item { display: flex; gap: 12px; padding: 11px 4px; border-bottom: 1px solid var(--line); }
 .feed-item .when { color: var(--muted); font-size: 12px; min-width: 64px; }
 .feed-item .sdot { width: 10px; height: 10px; border-radius: 50%; margin-top: 5px; flex: none; }
