@@ -16,7 +16,9 @@
       </div>
     </div>
     <div class="actions">
-      <button class="primary" onclick="cmd('scanAndAnalyze')">🔍 Analisar agora (com IA)</button>
+      <button id="btnAnalyze" class="primary" onclick="cmd('scanAndAnalyze')">🔍 Analisar agora (com IA)</button>
+      <button id="btnConfigAI" class="icon-btn" style="display:none"
+        title="Configurar IA (token do Claude)" onclick="cmd('configureToken')">🔧 Configurar IA</button>
       <button onclick="cmd('scanOnly')">⚡ Varredura rápida (grátis)</button>
       <span id="lastScan" class="muted" style="font-size:13px"></span>
     </div>

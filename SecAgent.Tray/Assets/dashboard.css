@@ -32,6 +32,11 @@ button {
 button:hover { background: #334155; }
 button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
 button.primary:hover { background: #2563eb; }
+button:disabled { opacity: .5; cursor: default; }
+button:disabled:hover { background: var(--panel2); }
+/* Botão de configurar a IA, mostrado quando o token do Claude não está pronto. */
+button.icon-btn { background: var(--orange); border-color: var(--orange); color: #1f2937; font-weight: 600; }
+button.icon-btn:hover { background: #d97706; }
 
 #progress { margin-top: 14px; display: none; }
 #progress .label { font-size: 13px; color: var(--muted); margin-bottom: 6px; }

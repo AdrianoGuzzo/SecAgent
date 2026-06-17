@@ -235,6 +235,9 @@ public class TrayApplicationContext : ApplicationContext
             case "scanAndAnalyze":
                 RequestTrigger(ScanAndAnalyzeTrigger, "Varredura + análise iniciadas, aguarde ~1-2 min...");
                 return;
+            case "configureToken":
+                OpenTokenSetup();
+                return;
         }
 
         if (cmd.StartsWith("blockIp:", StringComparison.Ordinal))
@@ -249,6 +252,19 @@ public class TrayApplicationContext : ApplicationContext
             RequestTrigger($"unblock-ip-{SanitizeIp(ip)}.trigger",
                 $"Desbloqueando {ip}…", ip);
         }
+    }
+
+    // Opens the native token-setup window over the dashboard. After a successful
+    // save, refresh the page so the AI button replaces the "Configurar IA" wrench
+    // without reopening the panel.
+    private void OpenTokenSetup()
+    {
+        using var form = new TokenSetupForm();
+        var result = _dashboard is { IsDisposed: false }
+            ? form.ShowDialog(_dashboard)
+            : form.ShowDialog();
+        if (result == DialogResult.OK)
+            _dataPump?.EmitTokenStatus();
     }
 
     // IPv6 addresses carry ':' / '%', which are illegal in Windows filenames.
