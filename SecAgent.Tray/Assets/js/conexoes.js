@@ -6,6 +6,22 @@ let connSort = { key: null, dir: 1 };
 
 // IPs atualmente bloqueados (regras de firewall criadas pelo Service).
 let blockedIps = new Set();
+// Limiares de cor do tráfego (bytes/s). Ajuste aqui se quiser ser mais/menos sensível.
+const RATE_MID = 50 * 1024;          // >= 50 KB/s  => médio (amarelo)
+const RATE_HIGH = 1024 * 1024;       // >= 1 MB/s   => alto  (vermelho)
+
+// Formata bytes/s em texto amigável (—, KB/s, MB/s) com locale pt-BR.
+function fmtRate(bps) {
+  if (!bps || bps < 1024) return '—';
+  if (bps < 1024 * 1024) return (bps / 1024).toLocaleString('pt-BR', { maximumFractionDigits: 0 }) + ' KB/s';
+  return (bps / (1024 * 1024)).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' MB/s';
+}
+
+function rateLevel(bps) {
+  if (bps >= RATE_HIGH) return 'high';
+  if (bps >= RATE_MID) return 'mid';
+  return 'low';
+}
 
 function onNetwork(snap) {
   lastNetwork = snap;
@@ -61,12 +77,15 @@ function normalizeConn(c) {
       ispText = '…'; ispHtml = '<span class="muted">…</span>';
     }
   }
+  const bps = Number(c.bytesPerSec) || 0;
   return {
     inbound, remoteIsPublic: c.remoteIsPublic,
     localHtml, ispHtml,
+    rateText: fmtRate(bps), rateLevel: rateLevel(bps),
     sort: {
       dir: inbound ? 0 : 1,
       process: c.processName || '',
+      rate: bps,
       remote: c.remoteAddress || '',
       local: localText,
       isp: ispText,
@@ -85,7 +104,7 @@ function sortRows(rows) {
   return rows.sort((a, b) => {
     const av = a.sort[k], bv = b.sort[k];
     let cmp;
-    if (k === 'port' || k === 'dir') cmp = av - bv;
+    if (k === 'port' || k === 'dir' || k === 'rate') cmp = av - bv;
     else cmp = String(av).localeCompare(String(bv), 'pt-BR', { sensitivity: 'base' });
     return cmp * connSort.dir;
   });
@@ -111,6 +130,7 @@ function renderConns() {
     return `<tr class="${cls.trim()}">
       <td class="dir ${r.inbound?'in':'out'}">${r.inbound?'↓ Entrada':'↑ Saída'}</td>
       <td>${esc(r.processName)}</td>
+      <td class="rate rate-${r.rateLevel} mono">${r.rateText}</td>
       <td class="mono">${cut}${esc(r.remoteAddress)}</td>
       <td>${r.localHtml}</td>
       <td>${r.ispHtml}</td>

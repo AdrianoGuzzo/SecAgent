@@ -102,6 +102,10 @@ tr.inbound { background: rgba(239,68,68,.10); }
 .dir { font-weight: 600; }
 .dir.in { color: var(--red); }
 .dir.out { color: var(--green); }
+.rate { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rate-low  { color: var(--muted); }
+.rate-mid  { color: var(--yellow); }
+.rate-high { color: var(--red); }
 .mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; }
 .muted { color: var(--muted); }
 

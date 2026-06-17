@@ -142,8 +142,29 @@ public class TrayApplicationContext : ApplicationContext
         menu.Items.Add("Pasta de eventos", null, (_, _) => OpenFolder(EventsDir));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Atualizar status", null, (_, _) => RefreshStatus());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Remover SecAgent deste usuário", null, (_, _) => RemoveForCurrentUser());
         menu.Items.Add("Sair", null, (_, _) => ExitThread());
         return menu;
+    }
+        
+    // Remoção por usuário (sem admin): tira o Tray e o início automático apenas
+    // da conta atual. O serviço de monitoramento (machine-wide) continua. A
+    // desinstalação completa é feita em "Aplicativos e recursos" (admin).
+    private void RemoveForCurrentUser()
+    {
+        var answer = MessageBox.Show(
+            "Isto remove o ícone do SecAgent e o início automático apenas da SUA conta de usuário.\n\n" +
+            "O serviço de monitoramento continua rodando para a máquina. Para desinstalar o SecAgent " +
+            "por completo (todos os usuários), use \"Aplicativos e recursos\" do Windows (requer admin).\n\n" +
+            "Remover o SecAgent da sua conta agora?",
+            "Remover SecAgent deste usuário",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (answer != DialogResult.Yes)
+            return;
+
+        UserInstall.DisableForCurrentUser();
+        ExitThread();
     }
 
     private void RequestTrigger(string fileName, string okMessage, string? content = null)

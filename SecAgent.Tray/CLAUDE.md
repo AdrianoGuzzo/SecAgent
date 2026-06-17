@@ -2,7 +2,12 @@
 
 WinForms (.NET 8) com NotifyIcon na bandeja. Roda **na sessão do usuário**
 (não pode rodar dentro do Windows Service por causa do Session 0 isolation).
-Auto-start no login via `HKCU\...\Run`.
+Auto-start no login via `HKLM\...\Run` (registrado pelo instalador → vale para
+todos os usuários). Cada usuário pode remover só a sua cópia (sem admin) pelo
+menu "Remover SecAgent deste usuário", que grava o opt-out
+`HKCU\Software\SecAgent\TrayDisabled` honrado no `Program.Main` (ver
+`UserInstall.cs`). O script dev `install-tray.ps1` continua usando `HKCU\...\Run`
+(per-user, sem admin) — só para desenvolvimento.
 
 > Veja `..\CLAUDE.md` para visão geral da solution.
 
@@ -27,6 +32,8 @@ DataPump.cs                   # lê todos os arquivos do Service e empurra mensa
 GeoLookup.cs                  # ip-api.com (país/cidade/ISP) com cache + rate-limit; instância
                               # compartilhada e sempre ativa (alertas + dashboard); ResolveNowAsync p/ toast
 Assets/dashboard.html         # SPA (EmbeddedResource) renderizada via NavigateToString
+UserInstall.cs                # opt-out por usuário do autostart (HKCU\Software\SecAgent\TrayDisabled);
+                              # remoção "deste usuário" sem admin + limpeza do HKCU\Run legado
 AgentStatus.cs                # mirror do schema do Service (evita project reference)
 AnalysisProgress.cs           # mirror do schema do Service
 Models/                       # mirrors: AnalysisResult/Finding/Meta, SecurityEvent, IncidentReport, NetworkSnapshot/Connection

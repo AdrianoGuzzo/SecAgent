@@ -28,6 +28,13 @@ Write-Output "[3/4] Registering under HKCU\...\Run as '$valueName'"
 if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
 Set-ItemProperty -Path $runKey -Name $valueName -Value "`"$exePath`""
 
+# Limpa um opt-out anterior ("Remover SecAgent deste usuario" no menu do Tray),
+# tratando o re-install dev como "voltar ao padrao" (igual ao instalador Inno).
+$settingsKey = 'HKCU:\Software\SecAgent'
+if (Get-ItemProperty -Path $settingsKey -Name 'TrayDisabled' -ErrorAction SilentlyContinue) {
+    Remove-ItemProperty -Path $settingsKey -Name 'TrayDisabled' -ErrorAction SilentlyContinue
+}
+
 Write-Output "[4/4] Launching"
 Start-Process -FilePath $exePath
 Start-Sleep -Seconds 1

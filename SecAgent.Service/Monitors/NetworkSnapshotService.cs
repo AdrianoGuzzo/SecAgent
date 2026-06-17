@@ -37,6 +37,11 @@ public class NetworkSnapshotService : BackgroundService
     private HashSet<string> _seenInbound = new();
     private int _alertSeq;
 
+    // Per-connection cumulative byte counters from the previous cycle, keyed by
+    // 4-tuple, so we can derive a current throughput (bytes/s) by diffing.
+    private Dictionary<string, ulong> _prevBytes = new();
+    private DateTime _lastCycleUtc;
+
     public NetworkSnapshotService(
         ILogger<NetworkSnapshotService> logger,
         Channel<SecurityEvent> channel,
@@ -91,6 +96,13 @@ public class NetworkSnapshotService : BackgroundService
         var connections = new List<NetworkConnection>(rows.Count);
         var currentInbound = new HashSet<string>();
 
+        // Elapsed since last cycle drives the bytes/s derivation. First cycle (or
+        // after a long pause) leaves _prevBytes empty → every rate is 0.
+        var now = DateTime.UtcNow;
+        double elapsed = (now - _lastCycleUtc).TotalSeconds;
+        if (elapsed <= 0 || elapsed > 60) elapsed = 0;       // ignore stale/garbage intervals
+        var nextBytes = new Dictionary<string, ulong>(rows.Count);
+
         foreach (var r in rows)
         {
             // Direction: if our local port is one we're listening on, the peer
@@ -100,6 +112,14 @@ public class NetworkSnapshotService : BackgroundService
             bool remotePublic = !IsZero(r.RemoteAddress) && NetworkMonitor.IsPublicAddress(r.RemoteAddress);
             string procName = pidNames.TryGetValue(r.OwningPid, out var n) ? n : "desconhecido";
 
+            // Throughput: diff this connection's cumulative bytes vs last cycle.
+            ulong cum = r.CumBytesIn + r.CumBytesOut;
+            var connKey = $"{r.LocalAddress}:{r.LocalPort}|{r.RemoteAddress}:{r.RemotePort}";
+            nextBytes[connKey] = cum;
+            long bytesPerSec = 0;
+            if (elapsed > 0 && _prevBytes.TryGetValue(connKey, out var prev) && cum >= prev)
+                bytesPerSec = (long)((cum - prev) / elapsed);
+
             connections.Add(new NetworkConnection(
                 Direction: direction,
                 LocalAddress: r.LocalAddress.ToString(),
@@ -108,7 +128,8 @@ public class NetworkSnapshotService : BackgroundService
                 RemotePort: r.RemotePort,
                 ProcessName: procName,
                 Pid: r.OwningPid,
-                RemoteIsPublic: remotePublic));
+                RemoteIsPublic: remotePublic,
+                BytesPerSec: bytesPerSec));
 
             if (inbound && remotePublic)
             {
@@ -118,8 +139,10 @@ public class NetworkSnapshotService : BackgroundService
             }
         }
 
+        _prevBytes = nextBytes;        // drop connections that vanished — no leak
+        _lastCycleUtc = now;
         _seenInbound = currentInbound;
-        WriteSnapshotAtomic(new NetworkSnapshot(DateTime.UtcNow, connections));
+        WriteSnapshotAtomic(new NetworkSnapshot(now, connections));
     }
 
     private void MaybeEmitInbound(string key, IpHlpApi.TcpConnectionRow r, string procName)
