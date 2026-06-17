@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using Microsoft.Extensions.Options;
@@ -117,7 +118,11 @@ public class TriggerWatcher : BackgroundService
                         await _runner.RunScanOnlyAsync("tray", ct);
                         break;
                     case ScanAndAnalyzeTrigger:
-                        await _runner.RunScanAndAnalyzeAsync("tray", ct);
+                        // O conteúdo carrega a escolha de modelo/esforço feita no painel
+                        // ({"model":"sonnet","effort":"high"}). Conteúdo legado/ausente
+                        // (timestamp ISO) → (null, null) → defaults no ScanRunner.
+                        var (model, effort) = ReadAnalyzeOptions(fullPath);
+                        await _runner.RunScanAndAnalyzeAsync("tray", ct, model, effort);
                         break;
                     default:
                         _logger.LogWarning("Unknown trigger file: {Name}", name);
@@ -149,6 +154,28 @@ public class TriggerWatcher : BackgroundService
             return IPAddress.TryParse(content, out var ip) ? ip.ToString() : null;
         }
         catch { return null; }
+    }
+
+    /// <summary>
+    /// Reads the model/effort the Tray wrote into the scan-and-analyze trigger
+    /// ({"model":"sonnet","effort":"high"}). Returns (null, null) for legacy
+    /// timestamp content or anything unparseable — the ScanRunner then falls back
+    /// to the configured defaults. Values are NOT validated here; ScanRunner does it.
+    /// </summary>
+    private static (string? Model, string? Effort) ReadAnalyzeOptions(string path)
+    {
+        try
+        {
+            var content = File.ReadAllText(path).Trim();
+            if (string.IsNullOrEmpty(content) || content[0] != '{') return (null, null);
+
+            using var doc = JsonDocument.Parse(content);
+            var root = doc.RootElement;
+            var model = root.TryGetProperty("model", out var m) ? m.GetString() : null;
+            var effort = root.TryGetProperty("effort", out var e) ? e.GetString() : null;
+            return (model, effort);
+        }
+        catch { return (null, null); }
     }
 
     /// <summary>

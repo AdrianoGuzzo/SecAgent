@@ -38,6 +38,20 @@ button:disabled:hover { background: var(--panel2); }
 button.icon-btn { background: var(--orange); border-color: var(--orange); color: #1f2937; font-weight: 600; }
 button.icon-btn:hover { background: #d97706; }
 
+/* Bloco de escolha de modelo/esforço ao lado do botão "Analisar agora". */
+.ai-controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.ai-field {
+  display: flex; flex-direction: column; gap: 2px;
+  font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em;
+}
+.ai-field select {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+  padding: 7px 9px; border-radius: 8px; font-size: 13px; cursor: pointer;
+}
+.ai-field select:disabled { opacity: .45; cursor: default; }
+.ai-field.disabled { opacity: .6; }
+#aiEstimate { font-size: 13px; }
+
 #progress { margin-top: 14px; display: none; }
 #progress .label { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
 .pbar { height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; }

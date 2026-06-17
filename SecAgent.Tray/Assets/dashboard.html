@@ -16,7 +16,16 @@
       </div>
     </div>
     <div class="actions">
-      <button id="btnAnalyze" class="primary" onclick="cmd('scanAndAnalyze')">🔍 Analisar agora (com IA)</button>
+      <div id="aiControls" class="ai-controls" style="display:none">
+        <label class="ai-field">Modelo
+          <select id="aiModel"></select>
+        </label>
+        <label class="ai-field" id="aiEffortField">Esforço
+          <select id="aiEffort"></select>
+        </label>
+        <button id="btnAnalyze" class="primary">🔍 Analisar agora (com IA)</button>
+        <span id="aiEstimate" class="muted"></span>
+      </div>
       <button id="btnConfigAI" class="icon-btn" style="display:none"
         title="Configurar IA (token do Claude)" onclick="cmd('configureToken')">🔧 Configurar IA</button>
       <button onclick="cmd('scanOnly')">⚡ Varredura rápida (grátis)</button>
@@ -84,6 +93,7 @@
   </main>
 
   <script src="js/core.js"></script>
+  <script src="js/analyze.js"></script>
   <script src="js/resumo.js"></script>
   <script src="js/conexoes.js"></script>
   <script src="js/eventos.js"></script>

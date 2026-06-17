@@ -41,18 +41,26 @@ public class ClaudeAnalyzer
     // Scan analysis (daily)
     // ============================================================
 
-    public async Task<AnalysisResult> AnalyzeAsync(ScanResult scan, string scanFilePath, CancellationToken ct)
+    // model/effort são opcionais: quando vêm do trigger (escolha do usuário no
+    // painel) sobrepõem os defaults de config. Já chegam validados pelo ScanRunner,
+    // mas normalizamos de novo aqui por segurança (fallback nos defaults).
+    public async Task<AnalysisResult> AnalyzeAsync(
+        ScanResult scan, string scanFilePath, CancellationToken ct,
+        string? model = null, string? effort = null)
     {
         Directory.CreateDirectory(_opts.ReportsDirectory);
 
-        var (envelope, elapsedMs, error) = await InvokeClaudeAsync(PromptBuilder.Build(scan), ct);
-        if (error != null)
-            return ScanFailure(scanFilePath, error, elapsedMs);
+        var useModel = ClaudeCapabilities.NormalizeModel(model, _opts.Model);
+        var useEffort = ClaudeCapabilities.NormalizeEffort(effort, _opts.Effort);
 
-        var meta = ToMeta(envelope!, elapsedMs);
+        var (envelope, elapsedMs, error) = await InvokeClaudeAsync(PromptBuilder.Build(scan), ct, useModel, useEffort);
+        if (error != null)
+            return ScanFailure(scanFilePath, error, elapsedMs, useModel, useEffort);
+
+        var meta = ToMeta(envelope!, elapsedMs, useModel, useEffort);
 
         if (envelope!.IsError || string.IsNullOrWhiteSpace(envelope.Result))
-            return ScanFailure(scanFilePath, $"Claude reported error: {envelope.Result ?? "(empty)"}", elapsedMs, meta);
+            return ScanFailure(scanFilePath, $"Claude reported error: {envelope.Result ?? "(empty)"}", elapsedMs, useModel, useEffort, meta);
 
         var raw = StripCodeFence(envelope.Result.Trim());
         ClaudeAnalysisPayload? payload;
@@ -64,7 +72,7 @@ public class ClaudeAnalyzer
         {
             _logger.LogError(ex, "Could not parse scan analysis payload");
             SaveRawFailure(raw, "scan", scanFilePath);
-            return ScanFailure(scanFilePath, $"Payload parse error: {ex.Message}", elapsedMs, meta);
+            return ScanFailure(scanFilePath, $"Payload parse error: {ex.Message}", elapsedMs, meta.Model, meta.Effort, meta);
         }
 
         var findings = payload?.Findings?.Select(f => new Finding(
@@ -106,7 +114,7 @@ public class ClaudeAnalyzer
         sb.AppendLine();
         sb.AppendLine($"- **Risk level:** {r.RiskLevel}");
         sb.AppendLine($"- **Scan source:** `{r.ScanFile}`");
-        sb.AppendLine($"- **Model:** {r.Meta.Model}  |  elapsed: {r.Meta.ElapsedMs}ms  |  tokens (in/cc/cr/out): {r.Meta.InputTokens}/{r.Meta.CacheCreationTokens}/{r.Meta.CacheReadTokens}/{r.Meta.OutputTokens}  |  cost: ${r.Meta.TotalCostUsd}");
+        sb.AppendLine($"- **Model:** {r.Meta.Model}{(r.Meta.Effort is null ? "" : $" (effort: {r.Meta.Effort})")}  |  elapsed: {r.Meta.ElapsedMs}ms  |  tokens (in/cc/cr/out): {r.Meta.InputTokens}/{r.Meta.CacheCreationTokens}/{r.Meta.CacheReadTokens}/{r.Meta.OutputTokens}  |  cost: ${r.Meta.TotalCostUsd}");
         sb.AppendLine();
         sb.AppendLine("## Summary");
         sb.AppendLine(r.Summary);
@@ -140,17 +148,21 @@ public class ClaudeAnalyzer
     {
         Directory.CreateDirectory(_opts.ReportsDirectory);
 
+        // Incidentes são automáticos (sem escolha do usuário): usa os defaults de config.
+        var useModel = ClaudeCapabilities.NormalizeModel(null, _opts.Model);
+        var useEffort = ClaudeCapabilities.NormalizeEffort(null, _opts.Effort);
+
         var prompt = BuildIncidentPrompt(events, windowStartUtc, windowEndUtc);
-        var (envelope, elapsedMs, error) = await InvokeClaudeAsync(prompt, ct);
+        var (envelope, elapsedMs, error) = await InvokeClaudeAsync(prompt, ct, useModel, useEffort);
 
         if (error != null)
-            return IncidentFailure(events, windowStartUtc, windowEndUtc, error, elapsedMs);
+            return IncidentFailure(events, windowStartUtc, windowEndUtc, error, elapsedMs, useModel, useEffort);
 
-        var meta = ToMeta(envelope!, elapsedMs);
+        var meta = ToMeta(envelope!, elapsedMs, useModel, useEffort);
 
         if (envelope!.IsError || string.IsNullOrWhiteSpace(envelope.Result))
             return IncidentFailure(events, windowStartUtc, windowEndUtc,
-                $"Claude error: {envelope.Result ?? "(empty)"}", elapsedMs, meta);
+                $"Claude error: {envelope.Result ?? "(empty)"}", elapsedMs, useModel, useEffort, meta);
 
         var raw = StripCodeFence(envelope.Result.Trim());
         ClaudeIncidentPayload? payload;
@@ -163,7 +175,7 @@ public class ClaudeAnalyzer
             _logger.LogError(ex, "Could not parse incident payload");
             SaveRawFailure(raw, "incident", null);
             return IncidentFailure(events, windowStartUtc, windowEndUtc,
-                $"Payload parse error: {ex.Message}", elapsedMs, meta);
+                $"Payload parse error: {ex.Message}", elapsedMs, meta.Model, meta.Effort, meta);
         }
 
         var report = new IncidentReport(
@@ -244,7 +256,7 @@ public class ClaudeAnalyzer
         sb.AppendLine($"- **Title:** {r.Title}");
         sb.AppendLine($"- **Window:** {r.WindowStartUtc:HH:mm:ss} → {r.WindowEndUtc:HH:mm:ss} UTC ({(r.WindowEndUtc - r.WindowStartUtc).TotalMinutes:F0} min)");
         sb.AppendLine($"- **Events:** {r.EventCount}");
-        sb.AppendLine($"- **Model:** {r.Meta.Model}  |  elapsed: {r.Meta.ElapsedMs}ms  |  tokens (in/cc/cr/out): {r.Meta.InputTokens}/{r.Meta.CacheCreationTokens}/{r.Meta.CacheReadTokens}/{r.Meta.OutputTokens}  |  cost: ${r.Meta.TotalCostUsd}");
+        sb.AppendLine($"- **Model:** {r.Meta.Model}{(r.Meta.Effort is null ? "" : $" (effort: {r.Meta.Effort})")}  |  elapsed: {r.Meta.ElapsedMs}ms  |  tokens (in/cc/cr/out): {r.Meta.InputTokens}/{r.Meta.CacheCreationTokens}/{r.Meta.CacheReadTokens}/{r.Meta.OutputTokens}  |  cost: ${r.Meta.TotalCostUsd}");
         sb.AppendLine();
         sb.AppendLine("## Summary");
         sb.AppendLine(r.Summary);
@@ -276,9 +288,9 @@ public class ClaudeAnalyzer
     // ============================================================
 
     private async Task<(ClaudeJsonResponse? Envelope, long ElapsedMs, string? Error)>
-        InvokeClaudeAsync(string prompt, CancellationToken ct)
+        InvokeClaudeAsync(string prompt, CancellationToken ct, string model, string effort)
     {
-        Trace($"InvokeClaudeAsync entered, prompt size = {prompt.Length} chars");
+        Trace($"InvokeClaudeAsync entered, prompt size = {prompt.Length} chars, model={model}, effort={effort}");
         if (!File.Exists(_opts.ExePath))
             return (null, 0, $"claude.exe not found at {_opts.ExePath}");
 
@@ -295,7 +307,7 @@ public class ClaudeAnalyzer
                 "-p",
                 "--output-format", "json",
                 "--input-format", "text",
-                "--model", _opts.Model,
+                "--model", model,
                 "--permission-mode", "bypassPermissions",
                 "--system-prompt", SystemPrompt,
                 "--disallowedTools", "*"
@@ -312,6 +324,12 @@ public class ClaudeAnalyzer
             CreateNoWindow = true,
             WorkingDirectory = _opts.ReportsDirectory
         };
+        // Haiku não aceita --effort; só passamos o flag em modelos que suportam.
+        if (ClaudeCapabilities.EffortSupported(model) && !string.IsNullOrWhiteSpace(effort))
+        {
+            psi.ArgumentList.Add("--effort");
+            psi.ArgumentList.Add(effort);
+        }
         psi.Environment[_opts.TokenEnvVarName] = token;
 
         var sw = Stopwatch.StartNew();
@@ -381,8 +399,8 @@ public class ClaudeAnalyzer
     // Helpers
     // ============================================================
 
-    private AnalysisMeta ToMeta(ClaudeJsonResponse envelope, long elapsedMs) => new(
-        Model: _opts.Model,
+    private static AnalysisMeta ToMeta(ClaudeJsonResponse envelope, long elapsedMs, string model, string effort) => new(
+        Model: model,
         ElapsedMs: elapsedMs,
         InputTokens: envelope.Usage?.InputTokens,
         OutputTokens: envelope.Usage?.OutputTokens,
@@ -390,25 +408,29 @@ public class ClaudeAnalyzer
         CacheReadTokens: envelope.Usage?.CacheReadInputTokens,
         TotalCostUsd: envelope.TotalCostUsd,
         SessionId: envelope.SessionId,
-        IsError: envelope.IsError);
+        IsError: envelope.IsError,
+        // Só registra o esforço quando ele foi de fato aplicado (não em Haiku).
+        Effort: ClaudeCapabilities.EffortSupported(model) ? effort : null);
 
-    private static AnalysisMeta EmptyMeta(string model, long elapsedMs) =>
-        new(model, elapsedMs, null, null, null, null, null, null, IsError: true);
+    private static AnalysisMeta EmptyMeta(string model, string? effort, long elapsedMs) =>
+        new(model, elapsedMs, null, null, null, null, null, null, IsError: true,
+            Effort: ClaudeCapabilities.EffortSupported(model) ? effort : null);
 
-    private AnalysisResult ScanFailure(string scanFilePath, string msg, long elapsedMs, AnalysisMeta? meta = null)
+    private AnalysisResult ScanFailure(string scanFilePath, string msg, long elapsedMs,
+        string model, string? effort, AnalysisMeta? meta = null)
     {
         _logger.LogWarning("Scan analysis failed: {Msg}", msg);
         return new AnalysisResult(DateTime.UtcNow, scanFilePath, "unknown", msg,
-            new(), meta ?? EmptyMeta(_opts.Model, elapsedMs));
+            new(), meta ?? EmptyMeta(model, effort, elapsedMs));
     }
 
     private IncidentReport IncidentFailure(
         List<SecurityEvent> events, DateTime start, DateTime end,
-        string msg, long elapsedMs, AnalysisMeta? meta = null)
+        string msg, long elapsedMs, string model, string? effort, AnalysisMeta? meta = null)
     {
         _logger.LogWarning("Incident analysis failed: {Msg}", msg);
         return new IncidentReport(DateTime.UtcNow, events.Count, start, end,
-            "unknown", "Analysis failure", msg, new(), meta ?? EmptyMeta(_opts.Model, elapsedMs));
+            "unknown", "Analysis failure", msg, new(), meta ?? EmptyMeta(model, effort, elapsedMs));
     }
 
     private static int SeverityRank(string s) => s.ToLowerInvariant() switch

@@ -58,8 +58,15 @@ public class ScanRunner
     // Always runs Claude after the scan. Used by the manual "scan + análise"
     // button. Scheduled scans go through the Worker, which decides whether to
     // analyze (free scan-only by default) — automatic AI is opt-in via config.
-    public async Task RunScanAndAnalyzeAsync(string trigger, CancellationToken ct)
+    //
+    // model/effort são opcionais: vêm do trigger quando o usuário escolhe no
+    // painel; caem nos defaults de config quando ausentes/inválidos.
+    public async Task RunScanAndAnalyzeAsync(
+        string trigger, CancellationToken ct, string? model = null, string? effort = null)
     {
+        var useModel = ClaudeCapabilities.NormalizeModel(model, _claudeOptions.Model);
+        var useEffort = ClaudeCapabilities.NormalizeEffort(effort, _claudeOptions.Effort);
+
         _progress.BeginScan(trigger);
         try
         {
@@ -68,13 +75,13 @@ public class ScanRunner
 
             _progress.EndScanBeginAnalysis(
                 Path.GetFileName(scan.Value.ScanPath),
-                _claudeOptions.Model,
+                useModel,
                 trigger);
 
             try
             {
-                _logger.LogInformation("Invoking Claude analyzer (model={Model})", _claudeOptions.Model);
-                await _analyzer.AnalyzeAsync(scan.Value.Result, scan.Value.ScanPath, ct);
+                _logger.LogInformation("Invoking Claude analyzer (model={Model}, effort={Effort})", useModel, useEffort);
+                await _analyzer.AnalyzeAsync(scan.Value.Result, scan.Value.ScanPath, ct, useModel, useEffort);
             }
             catch (Exception ex)
             {
