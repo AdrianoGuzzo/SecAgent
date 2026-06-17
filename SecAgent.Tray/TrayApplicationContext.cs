@@ -132,8 +132,8 @@ public class TrayApplicationContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Forçar scan agora (sem Claude — grátis)", null,
             (_, _) => RequestTrigger(ScanOnlyTrigger, "Scan iniciado, aguarde ~5s..."));
-        menu.Items.Add("Forçar scan + análise Claude (~$0.16)", null,
-            (_, _) => RequestTrigger(ScanAndAnalyzeTrigger, "Scan + análise iniciados, aguarde ~1-2 min..."));
+        menu.Items.Add("Forçar scan + análise Claude (último modelo escolhido)", null,
+            (_, _) => RequestAnalyze(AiPrefs.Load()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Abrir último relatório de scan", null, (_, _) => OpenLast("report_*.md"));
         menu.Items.Add("Abrir último relatório de incidente", null, (_, _) => OpenLast("incident_*.md"));
@@ -165,6 +165,16 @@ public class TrayApplicationContext : ApplicationContext
 
         UserInstall.DisableForCurrentUser();
         ExitThread();
+    }
+
+    // Dispara o scan + análise com a escolha de modelo/esforço embutida no
+    // conteúdo do trigger ({"model":"sonnet","effort":"high"}) — o Service lê e
+    // valida. Para Haiku o esforço é ignorado lá (não suporta --effort).
+    private void RequestAnalyze((string Model, string Effort) choice)
+    {
+        var content = JsonSerializer.Serialize(new { model = choice.Model, effort = choice.Effort });
+        RequestTrigger(ScanAndAnalyzeTrigger,
+            $"Varredura + análise ({choice.Model}) iniciadas, aguarde ~1-2 min...", content);
     }
 
     private void RequestTrigger(string fileName, string okMessage, string? content = null)
@@ -232,12 +242,26 @@ public class TrayApplicationContext : ApplicationContext
             case "scanOnly":
                 RequestTrigger(ScanOnlyTrigger, "Varredura iniciada, aguarde ~5s...");
                 return;
-            case "scanAndAnalyze":
-                RequestTrigger(ScanAndAnalyzeTrigger, "Varredura + análise iniciadas, aguarde ~1-2 min...");
-                return;
             case "configureToken":
                 OpenTokenSetup();
                 return;
+        }
+
+        // "scanAndAnalyze" (sem dados → última escolha salva) ou
+        // "scanAndAnalyze:<model>:<effort>" (escolha feita nos dropdowns do painel).
+        if (cmd == "scanAndAnalyze")
+        {
+            RequestAnalyze(AiPrefs.Load());
+            return;
+        }
+        if (cmd.StartsWith("scanAndAnalyze:", StringComparison.Ordinal))
+        {
+            var parts = cmd.Split(':');
+            var model = AiPrefs.NormalizeModel(parts.Length > 1 ? parts[1] : null);
+            var effort = AiPrefs.NormalizeEffort(parts.Length > 2 ? parts[2] : null);
+            AiPrefs.Save(model, effort);                 // lembra para a próxima vez (painel + menu)
+            RequestAnalyze((model, effort));
+            return;
         }
 
         if (cmd.StartsWith("blockIp:", StringComparison.Ordinal))

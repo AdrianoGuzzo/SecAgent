@@ -27,5 +27,6 @@ public record AnalysisMeta(
     int? CacheReadTokens,
     decimal? TotalCostUsd,
     string? SessionId,
-    bool IsError
+    bool IsError,
+    string? Effort = null              // nível de esforço usado (null = não aplicável, ex. Haiku)
 );

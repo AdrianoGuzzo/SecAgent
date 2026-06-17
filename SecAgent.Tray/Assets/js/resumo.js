@@ -14,7 +14,6 @@ class ResumoPanel {
   register(router) {
     router.registerAll({
       status:      s => this.onStatus(s),
-      tokenStatus: p => this.onTokenStatus(p),
       progress:    p => this.onProgress(p),
       report:      r => this.onReport(r),
       incident:    i => this.onIncident(i)
@@ -38,18 +37,6 @@ class ResumoPanel {
       document.getElementById('lastScan').textContent =
         `Última análise: ${t} · ${s.lastScan.findingsCount || 0} achado(s)`;
     }
-  }
-
-  // ---- token status (botão de IA vs. configurar) ----
-  onTokenStatus(p) {
-    const configured = !!(p && p.configured);
-    const analyze = document.getElementById('btnAnalyze');
-    const config = document.getElementById('btnConfigAI');
-    if (analyze) {
-      analyze.style.display = configured ? '' : 'none';
-      analyze.disabled = !configured;
-    }
-    if (config) config.style.display = configured ? 'none' : '';
   }
 
   // ---- progress ----

@@ -101,7 +101,20 @@ public sealed class DataPump : IDisposable
         EmitNetwork();
         EmitBlocked();
         EmitTokenStatus();
+        EmitAiPrefs();
         PreloadEvents();
+    }
+
+    /// <summary>
+    /// Envia a última escolha de modelo/esforço para o painel pré-selecionar os
+    /// dropdowns. Origem é o arquivo de prefs local (não um arquivo do Service),
+    /// por isso é computado aqui no host.
+    /// </summary>
+    public void EmitAiPrefs()
+    {
+        var (model, effort) = AiPrefs.Load();
+        Message?.Invoke("aiPrefs",
+            $"{{\"model\":\"{model}\",\"effort\":\"{effort}\"}}");
     }
 
     /// <summary>
