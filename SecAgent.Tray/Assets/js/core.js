@@ -1,64 +1,99 @@
-// ---- core: estado compartilhado, helpers, troca de abas e roteamento ----
+// ---- core: infraestrutura compartilhada (namespace, helpers, bridge, roteador, abas) ----
 
-// ---- tab switching ----
-document.querySelectorAll('nav a').forEach(a => {
-  a.onclick = () => {
+// Namespace único exposto às demais abas (resumo/conexoes/eventos), carregadas depois.
+const SecAgent = window.SecAgent = {};
+
+// ---- severidade ----
+// Mapeia a severidade textual em rótulo/classe CSS/cor usados pelos cards e feed.
+class Severity {
+  static MAP = {
+    critical: { label: 'CRÍTICO', cls: 'critical', color: '#b91c1c' },
+    high:     { label: 'ALTO',    cls: 'high',     color: '#ef4444' },
+    medium:   { label: 'MÉDIO',   cls: 'medium',   color: '#f59e0b' },
+    low:      { label: 'BAIXO',   cls: 'low',      color: '#ca8a04' },
+    info:     { label: 'INFO',    cls: 'info',     color: '#64748b' }
+  };
+
+  static of(s) { return Severity.MAP[(s || 'info').toLowerCase()] || Severity.MAP.info; }
+}
+
+// ---- formatação genérica ----
+class Format {
+  // Escapa HTML para prevenir XSS ao injetar texto vindo do Service via innerHTML.
+  static esc(s) {
+    return (s == null ? '' : String(s))
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // Código de país de 2 letras -> emoji de bandeira (ex.: "BR" -> 🇧🇷).
+  static flag(cc) {
+    if (!cc || cc.length !== 2) return '🌐';
+    const A = 0x1F1E6;
+    return String.fromCodePoint(A + cc.charCodeAt(0) - 65, A + cc.charCodeAt(1) - 65);
+  }
+
+  // ISO timestamp -> "HH:mm:ss" em pt-BR; string vazia se inválido.
+  static time(iso) {
+    try { return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
+    catch (e) { return ''; }
+  }
+}
+
+// ---- ponte com o host C# (WebView2) ----
+// Encapsula window.chrome.webview: enviar comandos e assinar mensagens.
+class Bridge {
+  // Envia um comando para o host (botões de scan, block/unblock de IP, etc.).
+  send(cmd) {
+    try { window.chrome.webview.postMessage({ cmd }); } catch (e) {}
+  }
+
+  // Registra um callback que recebe o payload bruto de cada mensagem do host.
+  onMessage(handler) {
+    window.chrome.webview.addEventListener('message', e => handler(e.data));
+  }
+}
+
+// ---- roteamento de mensagens ----
+// Despacha cada mensagem {type, payload} para o handler registrado pela aba dona.
+// Os handlers são registrados pelos scripts das abas, carregados depois deste.
+class MessageRouter {
+  constructor(bridge) {
+    this._handlers = {};
+    bridge.onMessage(m => this._dispatch(m));
+  }
+
+  register(type, fn) { this._handlers[type] = fn; }
+
+  registerAll(map) { Object.assign(this._handlers, map); }
+
+  _dispatch(m) {
+    if (!m || !m.type) return;
+    const fn = this._handlers[m.type];
+    if (fn) fn(m.payload);
+  }
+}
+
+// ---- troca de abas ----
+// Liga os links do <nav>: ativa o link clicado e mostra o .tab correspondente.
+class Tabs {
+  constructor() {
+    document.querySelectorAll('nav a').forEach(a => {
+      a.onclick = () => this._activate(a);
+    });
+  }
+
+  _activate(a) {
     document.querySelectorAll('nav a').forEach(x => x.classList.remove('active'));
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
     a.classList.add('active');
     document.getElementById(a.dataset.tab).classList.add('active');
-  };
-});
-
-function cmd(c) {
-  try { window.chrome.webview.postMessage({ cmd: c }); } catch (e) {}
-}
-
-// ---- state ----
-let geoMap = {};        // ip -> {country, countryCode, city, isp}
-let lastNetwork = null;
-let events = [];
-const MAX_FEED = 200;
-
-const SEV = {
-  critical: { label: 'CRÍTICO', cls: 'critical', color: '#b91c1c' },
-  high:     { label: 'ALTO',    cls: 'high',     color: '#ef4444' },
-  medium:   { label: 'MÉDIO',   cls: 'medium',   color: '#f59e0b' },
-  low:      { label: 'BAIXO',   cls: 'low',      color: '#ca8a04' },
-  info:     { label: 'INFO',    cls: 'info',     color: '#64748b' }
-};
-function sev(s) { return SEV[(s || 'info').toLowerCase()] || SEV.info; }
-
-function esc(s) {
-  return (s == null ? '' : String(s))
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-function flag(cc) {
-  if (!cc || cc.length !== 2) return '🌐';
-  const A = 0x1F1E6;
-  return String.fromCodePoint(A + cc.charCodeAt(0) - 65, A + cc.charCodeAt(1) - 65);
-}
-function timeStr(iso) {
-  try { return new Date(iso).toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
-  catch (e) { return ''; }
-}
-
-// ---- message routing ----
-// Os handlers on* são definidos nos scripts de cada aba (resumo/conexoes/eventos),
-// carregados depois deste. Como são function declarations em escopo global, já
-// estão disponíveis quando uma mensagem chega.
-window.chrome.webview.addEventListener('message', e => {
-  const m = e.data;
-  if (!m || !m.type) return;
-  switch (m.type) {
-    case 'status':   onStatus(m.payload); break;
-    case 'progress': onProgress(m.payload); break;
-    case 'report':   onReport(m.payload); break;
-    case 'incident': onIncident(m.payload); break;
-    case 'events':   onEvents(m.payload); break;
-    case 'network':  onNetwork(m.payload); break;
-    case 'geo':      onGeo(m.payload); break;
-    case 'blocked':  onBlocked(m.payload); break;
-    case 'tokenStatus': onTokenStatus(m.payload); break;
   }
-});
+}
+
+// ---- bootstrap ----
+SecAgent.bridge = new Bridge();
+SecAgent.router = new MessageRouter(SecAgent.bridge);
+new Tabs();
+
+// Shim global usado pelos onclick inline do dashboard.html (cmd('scanOnly') etc.).
+function cmd(c) { SecAgent.bridge.send(c); }

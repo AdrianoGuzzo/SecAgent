@@ -1,27 +1,43 @@
 // ---- aba Atividade ao vivo: feed de eventos de segurança ----
 
-function onEvents(list) {
-  if (!Array.isArray(list) || !list.length) return;
-  events = list.concat(events).slice(0, MAX_FEED);
-  renderFeed();
+class EventosPanel {
+  static MAX_FEED = 200;
+  static SRC = { process: 'Processo', network: 'Rede', eventlog: 'Windows' };
+
+  constructor() {
+    this._events = [];
+  }
+
+  register(router) {
+    router.register('events', list => this.onEvents(list));
+  }
+
+  onEvents(list) {
+    if (!Array.isArray(list) || !list.length) return;
+    this._events = list.concat(this._events).slice(0, EventosPanel.MAX_FEED);
+    this._renderFeed();
+  }
+
+  _renderFeed() {
+    document.getElementById('evtBadge').textContent = this._events.length;
+    const host = document.getElementById('feed');
+    if (!this._events.length) {
+      host.innerHTML = '<div class="empty">Nenhum evento recente.</div>';
+      return;
+    }
+    host.innerHTML = this._events.map(e => {
+      const sv = Severity.of(e.severity);
+      return `<div class="feed-item">
+        <div class="when">${Format.time(e.timestampUtc)}</div>
+        <div class="sdot" style="background:${sv.color}"></div>
+        <div class="body">
+          <div class="t">${Format.esc(e.title)}</div>
+          <div class="d">${Format.esc(e.description)}</div>
+          <div class="src">${EventosPanel.SRC[(e.source || '').toLowerCase()] || Format.esc(e.source)}</div>
+        </div>
+      </div>`;
+    }).join('');
+  }
 }
 
-const SRC = { process:'Processo', network:'Rede', eventlog:'Windows' };
-
-function renderFeed() {
-  document.getElementById('evtBadge').textContent = events.length;
-  const host = document.getElementById('feed');
-  if (!events.length) { host.innerHTML = '<div class="empty">Nenhum evento recente.</div>'; return; }
-  host.innerHTML = events.map(e => {
-    const sv = sev(e.severity);
-    return `<div class="feed-item">
-      <div class="when">${timeStr(e.timestampUtc)}</div>
-      <div class="sdot" style="background:${sv.color}"></div>
-      <div class="body">
-        <div class="t">${esc(e.title)}</div>
-        <div class="d">${esc(e.description)}</div>
-        <div class="src">${SRC[(e.source||'').toLowerCase()] || esc(e.source)}</div>
-      </div>
-    </div>`;
-  }).join('');
-}
+new EventosPanel().register(SecAgent.router);

@@ -61,6 +61,36 @@ janela (singleton em `_dashboard`). O **host C# faz toda a leitura de arquivo**
 - `DataPump` só roda enquanto a janela está aberta (Start/Stop); os watchers
   do ícone (abaixo) continuam independentes.
 
+## JavaScript do painel (`Assets/js/`)
+
+O JS do dashboard é **orientado a objetos com classes ES6** — sem estado global
+mutável, sem `function`/`let` soltos no escopo de módulo. **Todo `.js` novo deve
+seguir esse padrão**:
+
+- **`core.js` é a infraestrutura compartilhada** e carrega primeiro. Expõe o
+  namespace único `window.SecAgent` e as classes utilitárias:
+  - `Severity.of(s)` — severidade textual → `{label, cls, color}`.
+  - `Format.esc/flag/time` — escape de HTML (XSS), bandeira de país, hora pt-BR.
+  - `Bridge` — encapsula `window.chrome.webview` (`send(cmd)` / `onMessage`).
+  - `MessageRouter` — despacha cada `{type, payload}` do host para o handler da
+    aba dona. Instância em `SecAgent.router`.
+  - `Tabs` — troca de abas do `<nav>`.
+- **Cada aba/painel é uma única classe `XPanel`** (`ResumoPanel`, `ConexoesPanel`,
+  `EventosPanel`, …) no seu próprio arquivo:
+  - Estado vive em campos de instância (`this._x`), **nunca** em variáveis globais.
+  - Constantes/configs como **`static`** da classe (`static MAX_FEED = 200`).
+  - O `constructor` inicializa estado e faz wiring de DOM (helpers `_bindXxx`).
+  - Um método `register(router)` assina os tipos de mensagem que a aba trata
+    via `router.register('tipo', p => this.onTipo(p))` (ou `registerAll({...})`).
+  - Handlers públicos `onTipo(payload)`; render/helpers privados com prefixo `_`.
+  - **Bootstrap no fim do arquivo**: `new XPanel().register(SecAgent.router);`.
+- **Reutilize os utilitários** — chame `Format.esc/flag/time` e `Severity.of`;
+  não redefina helpers nem acesse `chrome.webview` direto (use `cmd(...)` ou o
+  `Bridge`).
+- Comentários em **pt-BR**, explicando o porquê (mesma densidade do código atual).
+- **Registre o arquivo novo em `dashboard.html`** na ordem dos `<script>` —
+  sempre **depois de `core.js`** (as classes do core precisam existir antes).
+
 ## Padrão arquitetural
 
 `TrayApplicationContext` (ApplicationContext) é o lifecycle owner. Ele cria:
