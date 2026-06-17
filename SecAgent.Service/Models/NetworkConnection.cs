@@ -9,7 +9,8 @@ namespace SecAgent.Service.Models;
 /// </summary>
 public record NetworkSnapshot(
     DateTime GeneratedAtUtc,
-    List<NetworkConnection> Connections
+    List<NetworkConnection> Connections,
+    List<NetworkInterfaceStat>? Interfaces = null
 );
 
 public record NetworkConnection(
@@ -22,4 +23,14 @@ public record NetworkConnection(
     int Pid,
     bool RemoteIsPublic,     // true when RemoteAddress is a routable public IP
     long BytesPerSec = 0     // current throughput (in+out) for this connection, bytes/s
+);
+
+/// <summary>
+/// Throughput de uma interface física (Wi-Fi/Ethernet) derivado dos contadores
+/// reais do adaptador (todos os protocolos, ao contrário do ESTATS por conexão).
+/// </summary>
+public record NetworkInterfaceStat(
+    string Name,            // nome amigável da NIC (ex.: "Wi-Fi")
+    long BytesDownPerSec,   // recebido, bytes/s
+    long BytesUpPerSec      // enviado, bytes/s
 );

@@ -27,10 +27,14 @@ public class MonitorOptions
 
     // Network snapshot (live connections table + inbound alerting)
     public bool NetworkSnapshotEnabled { get; set; } = true;
-    public int NetworkSnapshotSeconds { get; set; } = 2;
+    public double NetworkSnapshotSeconds { get; set; } = 0.5;
     public bool EmitInboundEvents { get; set; } = true;
     public List<int> InboundPortWhitelist { get; set; } = new();
     public string SnapshotPath { get; set; } = @"C:\ProgramData\SecAgent\network.json";
+
+    // Per-interface throughput (total agregado + detalhe por NIC no snapshot).
+    // Só interfaces físicas reais (Wi-Fi/Ethernet) ativas; ignora virtuais/loopback.
+    public bool InterfaceStatsEnabled { get; set; } = true;
 
     // Immediate inbound alerts (toast via Tray). Sensitive (admin/remote-access)
     // ports raise a "critical" alert; others "medium".
