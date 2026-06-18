@@ -32,6 +32,14 @@ public class MonitorOptions
     public List<int> InboundPortWhitelist { get; set; } = new();
     public string SnapshotPath { get; set; } = @"C:\ProgramData\SecAgent\network.json";
 
+    // Medidor de tráfego por IP (play/stop pelo painel). Saída do TrafficAccumulator.
+    public string TrafficTrackPath { get; set; } = @"C:\ProgramData\SecAgent\traffic-track.json";
+
+    // Fonte ÚNICA de tráfego do projeto (ETW kernel, always-on): bytes/s por
+    // conexão + medidor por IP. Se false, o collector não abre sessão ETW e
+    // ambos ficam zerados (rede de segurança — nada quebra).
+    public bool TrafficEtwEnabled { get; set; } = true;
+
     // Per-interface throughput (total agregado + detalhe por NIC no snapshot).
     // Só interfaces físicas reais (Wi-Fi/Ethernet) ativas; ignora virtuais/loopback.
     public bool InterfaceStatsEnabled { get; set; } = true;

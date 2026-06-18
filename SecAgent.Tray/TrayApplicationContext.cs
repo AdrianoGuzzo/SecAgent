@@ -242,6 +242,12 @@ public class TrayApplicationContext : ApplicationContext
             case "scanOnly":
                 RequestTrigger(ScanOnlyTrigger, "Varredura iniciada, aguarde ~5s...");
                 return;
+            case "trafficStart":
+                RequestTrigger("traffic-track-start.trigger", "Medindo tráfego por IP…");
+                return;
+            case "trafficStop":
+                RequestTrigger("traffic-track-stop.trigger", "Medição de tráfego encerrada.");
+                return;
             case "configureToken":
                 OpenTokenSetup();
                 return;

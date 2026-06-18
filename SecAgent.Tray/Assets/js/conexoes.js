@@ -46,6 +46,9 @@ class ConexoesPanel {
     this._blockedIps = new Set(((d && d.blocked) || []).map(b => b.ip));
     this._renderConns();
     this._renderBlocked();
+    // O roteador só permite um handler por tipo e este é o dono de 'blocked';
+    // a aba Tráfego por IP precisa do mesmo conjunto p/ marcar IPs já bloqueados.
+    SecAgent.trafegoIp?.onBlocked(this._blockedIps);
   }
 
   // ---- DOM wiring ----

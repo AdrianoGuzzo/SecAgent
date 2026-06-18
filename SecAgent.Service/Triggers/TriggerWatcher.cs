@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using Microsoft.Extensions.Options;
+using SecAgent.Service.Monitors;
 using SecAgent.Service.Remediation;
 
 namespace SecAgent.Service.Triggers;
@@ -15,6 +16,8 @@ namespace SecAgent.Service.Triggers;
 ///   scan-and-analyze.trigger  -> ScanRunner.RunScanAndAnalyzeAsync
 ///   block-ip-&lt;ip&gt;.trigger     -> IpBlocker.Block   (IP read from file content)
 ///   unblock-ip-&lt;ip&gt;.trigger   -> IpBlocker.Unblock (IP read from file content)
+///   traffic-track-start.trigger -> TrafficAccumulator.Start (medidor por IP)
+///   traffic-track-stop.trigger  -> TrafficAccumulator.Stop
 /// Trigger file is always deleted after processing (success OR error).
 /// Triggers written while the service was down are drained on startup.
 /// </summary>
@@ -24,20 +27,24 @@ public class TriggerWatcher : BackgroundService
     private const string ScanAndAnalyzeTrigger = "scan-and-analyze.trigger";
     private const string BlockIpPrefix = "block-ip-";
     private const string UnblockIpPrefix = "unblock-ip-";
+    private const string TrafficStartTrigger = "traffic-track-start.trigger";
+    private const string TrafficStopTrigger = "traffic-track-stop.trigger";
 
     private readonly ILogger<TriggerWatcher> _logger;
     private readonly ScanRunner _runner;
     private readonly IpBlocker _blocker;
+    private readonly TrafficAccumulator _traffic;
     private readonly TriggerOptions _opts;
     private readonly Dictionary<string, DateTime> _lastFiredUtc = new();
     private readonly object _lock = new();
     private FileSystemWatcher? _watcher;
 
-    public TriggerWatcher(ILogger<TriggerWatcher> logger, ScanRunner runner, IpBlocker blocker, IOptions<TriggerOptions> opts)
+    public TriggerWatcher(ILogger<TriggerWatcher> logger, ScanRunner runner, IpBlocker blocker, TrafficAccumulator traffic, IOptions<TriggerOptions> opts)
     {
         _logger = logger;
         _runner = runner;
         _blocker = blocker;
+        _traffic = traffic;
         _opts = opts.Value;
     }
 
@@ -123,6 +130,12 @@ public class TriggerWatcher : BackgroundService
                         // (timestamp ISO) → (null, null) → defaults no ScanRunner.
                         var (model, effort) = ReadAnalyzeOptions(fullPath);
                         await _runner.RunScanAndAnalyzeAsync("tray", ct, model, effort);
+                        break;
+                    case TrafficStartTrigger:
+                        _traffic.Start();
+                        break;
+                    case TrafficStopTrigger:
+                        _traffic.Stop();
                         break;
                     default:
                         _logger.LogWarning("Unknown trigger file: {Name}", name);

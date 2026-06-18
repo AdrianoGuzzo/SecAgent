@@ -178,6 +178,10 @@ tr.blocked .mono { text-decoration: line-through; text-decoration-color: var(--r
 .traffic-card-hint { font-size: 12px; color: var(--muted); }
 
 .traffic-bar { margin-bottom: 12px; }
+
+/* ---- barra play/stop do medidor de tráfego por IP ---- */
+.trafip-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.trafip-bar #trafipStatus { font-size: 13px; }
 .traffic-chip {
   display: inline-block; background: var(--panel2); border: 1px solid var(--line);
   border-radius: 999px; padding: 5px 14px; font-size: 13px; font-weight: 600;
