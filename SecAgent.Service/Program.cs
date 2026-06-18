@@ -49,6 +49,12 @@ builder.Services.AddSingleton(sp =>
         SingleWriter = false
     });
 });
+builder.Services.AddSingleton<TrafficAccumulator>();   // medidor de tráfego por IP (play/stop)
+// Fonte ÚNICA de tráfego (ETW kernel, always-on): alimenta o bytes/s por conexão
+// E o medidor por IP. Singleton + hosted service (mesma instância). Registrado
+// ANTES do NetworkSnapshotService, que injeta esta instância.
+builder.Services.AddSingleton<NetworkTrafficEtwCollector>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<NetworkTrafficEtwCollector>());
 builder.Services.AddHostedService<ProcessMonitor>();
 builder.Services.AddHostedService<NetworkMonitor>();
 builder.Services.AddHostedService<NetworkSnapshotService>();

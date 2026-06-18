@@ -45,6 +45,16 @@ class Format {
     if (bps < 1024 * 1024) return (bps / 1024).toLocaleString('pt-BR', { maximumFractionDigits: 0 }) + ' KB/s';
     return (bps / (1024 * 1024)).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' MB/s';
   }
+
+  // bytes acumulados -> texto amigável (B, KB, MB, GB) com locale pt-BR. Diferente
+  // de rate(): é volume total (sem "/s"). Usado no medidor de tráfego por IP.
+  static bytes(n) {
+    const v = Number(n) || 0;
+    if (v < 1024) return v.toLocaleString('pt-BR') + ' B';
+    if (v < 1024 * 1024) return (v / 1024).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' KB';
+    if (v < 1024 * 1024 * 1024) return (v / (1024 * 1024)).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' MB';
+    return (v / (1024 * 1024 * 1024)).toLocaleString('pt-BR', { maximumFractionDigits: 2 }) + ' GB';
+  }
 }
 
 // ---- ponte com o host C# (WebView2) ----

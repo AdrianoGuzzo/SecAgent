@@ -22,6 +22,7 @@ public sealed class DataPump : IDisposable
     private const string ProgressPath = @"C:\ProgramData\SecAgent\progress.json";
     private const string NetworkPath = @"C:\ProgramData\SecAgent\network.json";
     private const string BlockedPath = @"C:\ProgramData\SecAgent\blocked.json";
+    private const string TrafficTrackPath = @"C:\ProgramData\SecAgent\traffic-track.json";
     private const string ReportsDir = @"C:\ProgramData\SecAgent\reports";
     private const string EventsDir = @"C:\ProgramData\SecAgent\events";
     private const int PreloadEventLines = 50;
@@ -43,6 +44,7 @@ public sealed class DataPump : IDisposable
     private FileSystemWatcher? _progressWatcher;
     private FileSystemWatcher? _networkWatcher;
     private FileSystemWatcher? _blockedWatcher;
+    private FileSystemWatcher? _trafficWatcher;
     private FileSystemWatcher? _reportWatcher;
     private FileSystemWatcher? _eventsWatcher;
 
@@ -73,6 +75,7 @@ public sealed class DataPump : IDisposable
         TryWatch(ref _progressWatcher, DataDir, "progress.json", OnProgressChanged, OnProgressDeleted);
         TryWatch(ref _networkWatcher, DataDir, "network.json", (_, _) => EmitNetwork(), null);
         TryWatch(ref _blockedWatcher, DataDir, "blocked.json", (_, _) => EmitBlocked(), null);
+        TryWatch(ref _trafficWatcher, DataDir, "traffic-track.json", (_, _) => EmitTrafficTrack(), null);
         TryWatch(ref _reportWatcher, ReportsDir, "*.json", OnReportChanged, null);
         TryWatch(ref _eventsWatcher, EventsDir, "events_*.jsonl", (_, _) => ReadNewEvents(), null);
 
@@ -87,6 +90,7 @@ public sealed class DataPump : IDisposable
         DisposeWatcher(ref _progressWatcher);
         DisposeWatcher(ref _networkWatcher);
         DisposeWatcher(ref _blockedWatcher);
+        DisposeWatcher(ref _trafficWatcher);
         DisposeWatcher(ref _reportWatcher);
         DisposeWatcher(ref _eventsWatcher);
     }
@@ -100,6 +104,7 @@ public sealed class DataPump : IDisposable
         EmitLatestIncident();
         EmitNetwork();
         EmitBlocked();
+        EmitTrafficTrack();
         EmitTokenStatus();
         EmitAiPrefs();
         PreloadEvents();
@@ -196,6 +201,12 @@ public sealed class DataPump : IDisposable
     {
         var json = ReadAndCamel<BlockedList>(BlockedPath);
         if (json is not null) Message?.Invoke("blocked", json);
+    }
+
+    private void EmitTrafficTrack()
+    {
+        var json = ReadAndCamel<TrafficTrackSnapshot>(TrafficTrackPath);
+        if (json is not null) Message?.Invoke("trafficTrack", json);
     }
 
     private void OnGeoResolved(string ip, GeoLookup.GeoInfo info) => EmitGeo(ip, info);
@@ -318,6 +329,7 @@ public sealed class DataPump : IDisposable
         EmitProgress();
         EmitNetwork();
         EmitBlocked();
+        EmitTrafficTrack();
         EmitTokenStatus();
         ReadNewEvents();
     }

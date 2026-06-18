@@ -29,6 +29,8 @@ public class NetworkSnapshotService : BackgroundService
     private readonly ILogger<NetworkSnapshotService> _logger;
     private readonly ChannelWriter<SecurityEvent> _writer;
     private readonly MonitorOptions _opts;
+    private readonly TrafficAccumulator _traffic;
+    private readonly NetworkTrafficEtwCollector _etw;
     private readonly HashSet<int> _inboundPortWhitelist;
     private readonly HashSet<int> _sensitivePorts;
     private readonly List<string> _selfFragments;
@@ -56,11 +58,15 @@ public class NetworkSnapshotService : BackgroundService
     public NetworkSnapshotService(
         ILogger<NetworkSnapshotService> logger,
         Channel<SecurityEvent> channel,
-        IOptions<MonitorOptions> opts)
+        IOptions<MonitorOptions> opts,
+        TrafficAccumulator traffic,
+        NetworkTrafficEtwCollector etw)
     {
         _logger = logger;
         _writer = channel.Writer;
         _opts = opts.Value;
+        _traffic = traffic;
+        _etw = etw;
         _inboundPortWhitelist = new HashSet<int>(_opts.InboundPortWhitelist);
         _sensitivePorts = new HashSet<int>(_opts.SensitiveInboundPorts);
         _selfFragments = _opts.SelfReferenceFragments ?? new List<string>();
@@ -124,8 +130,10 @@ public class NetworkSnapshotService : BackgroundService
             string procName = pidNames.TryGetValue(r.OwningPid, out var n) ? n : "desconhecido";
 
             // Throughput: diff this connection's cumulative bytes vs last cycle.
-            ulong cum = r.CumBytesIn + r.CumBytesOut;
+            // Os bytes vêm do ETW (NetworkTrafficEtwCollector), fonte única do
+            // projeto — substitui o antigo ESTATS por conexão.
             var connKey = $"{r.LocalAddress}:{r.LocalPort}|{r.RemoteAddress}:{r.RemotePort}";
+            ulong cum = _etw.GetConnectionCumBytes(connKey);
             nextBytes[connKey] = cum;
             long bytesPerSec = 0;
             if (elapsed > 0 && _prevBytes.TryGetValue(connKey, out var prev) && cum >= prev)
@@ -149,6 +157,11 @@ public class NetworkSnapshotService : BackgroundService
                 MaybeEmitInbound(key, r, procName);
             }
         }
+
+        // Medidor por IP: regrava traffic-track.json resolvendo PID→nome com o mapa
+        // deste ciclo. No-op rápido quando a medição está parada. A coleta em si
+        // vem do NetworkTrafficEtwCollector (ETW), não daqui.
+        _traffic.Flush(pidNames, now);
 
         var interfaces = BuildInterfaceStats(elapsed);
 

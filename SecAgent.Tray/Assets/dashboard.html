@@ -40,6 +40,7 @@
   <nav>
     <a class="active" data-tab="resumo">Resumo</a>
     <a data-tab="conexoes">Conexões de rede <span class="badge" id="connBadge">0</span></a>
+    <a data-tab="trafego-ip">Tráfego por IP <span class="badge" id="trafipBadge">0</span></a>
     <a data-tab="eventos">Atividade ao vivo <span class="badge" id="evtBadge">0</span></a>
   </nav>
 
@@ -94,6 +95,32 @@
       </div>
     </section>
 
+    <section id="trafego-ip" class="tab">
+      <div class="legend">
+        Meça <b>quanto cada IP transferiu</b> durante um período. Clique em
+        <b>▶ Iniciar medição</b>, deixe rodando enquanto observa, e em
+        <b>⏹ Parar</b> para congelar os totais. A medição roda no serviço — pode
+        fechar o painel que ela continua. Use <b>Bloquear</b> para cortar um IP
+        que está consumindo muita banda.
+      </div>
+      <div class="traffic-bar trafip-bar">
+        <button id="btnTrafipStart" class="primary" onclick="cmd('trafficStart')">▶ Iniciar medição</button>
+        <button id="btnTrafipStop" onclick="cmd('trafficStop')" style="display:none">⏹ Parar</button>
+        <span id="trafipStatus" class="muted">Medição parada.</span>
+      </div>
+      <table>
+        <thead><tr>
+          <th data-sort-key="ip">Endereço remoto<span class="arrow"></span></th>
+          <th data-sort-key="process">Aplicativo<span class="arrow"></span></th>
+          <th data-sort-key="in">↓ Recebido<span class="arrow"></span></th>
+          <th data-sort-key="out">↑ Enviado<span class="arrow"></span></th>
+          <th data-sort-key="total">Total<span class="arrow"></span></th>
+        </tr></thead>
+        <tbody id="trafipRows"></tbody>
+      </table>
+      <div id="trafipEmpty" class="empty">Nenhum tráfego medido ainda. Clique em “Iniciar medição”.</div>
+    </section>
+
     <section id="eventos" class="tab">
       <div class="legend">Eventos de segurança detectados em tempo real (processos, rede e logs do Windows).</div>
       <div id="feed"><div class="empty">Nenhum evento recente.</div></div>
@@ -105,6 +132,7 @@
   <script src="js/resumo.js"></script>
   <script src="js/trafego.js"></script>
   <script src="js/conexoes.js"></script>
+  <script src="js/trafego-ip.js"></script>
   <script src="js/eventos.js"></script>
 </body>
 </html>
