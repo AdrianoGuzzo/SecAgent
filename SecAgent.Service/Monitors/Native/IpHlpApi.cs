@@ -1,5 +1,7 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Runtime.InteropServices;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Monitors.Native;
 
@@ -9,10 +11,13 @@ namespace SecAgent.Service.Monitors.Native;
 /// connection. Enumerates both IPv4 and IPv6 established connections.
 ///
 /// Gotchas:
-///  - Ports come back in network byte order packed in a uint → must byte-swap.
-///  - The two-call pattern: probe size, allocate, fill, iterate, free.
+///  - Ports come back in network byte order packed in a uint → must byte-swap
+///    (<see cref="PortSwap"/>).
+///  - The two-call pattern: probe size, allocate, fill, iterate, free. The table
+///    can grow between the probe and the fill (ERROR_INSUFFICIENT_BUFFER) → retry.
 /// </summary>
-public static class IpHlpApi
+[ExcludeFromCodeCoverage(Justification = "P/Invoke puro; lógica testável em PortSwap e no layout das structs")]
+internal static class IpHlpApi
 {
     private const int AF_INET = 2;
     private const int AF_INET6 = 23;
@@ -96,18 +101,20 @@ public static class IpHlpApi
         public byte EnableCollection;
     }
 
-    // Full read-only-dynamic block; we only read the first two counters but the
-    // API requires a buffer sized to the whole struct.
+    // Bloco read-only-dynamic completo (tcpestats.h). A ORDEM importa: a doc
+    // oficial é DataBytesOut, DataSegsOut, DataBytesIn, ... e SoftErrors é ULONG
+    // (32 bits). A versão anterior tinha DataBytesIn na 2ª posição, então o
+    // "bytes recebidos" lia na verdade a contagem de SEGMENTOS enviados.
     [StructLayout(LayoutKind.Sequential)]
-    private struct TCP_ESTATS_DATA_ROD_v0
+    internal struct TCP_ESTATS_DATA_ROD_v0
     {
         public ulong DataBytesOut;
-        public ulong DataBytesIn;
         public ulong DataSegsOut;
+        public ulong DataBytesIn;
         public ulong DataSegsIn;
         public ulong SegsOut;
         public ulong SegsIn;
-        public ulong SoftErrors;
+        public uint SoftErrors;
         public uint SoftErrorReason;
         public uint SndUna;
         public uint SndNxt;
@@ -143,117 +150,128 @@ public static class IpHlpApi
         public uint dwOwningPid;
     }
 
-    public record TcpConnectionRow(
-        IPAddress LocalAddress,
-        int LocalPort,
-        IPAddress RemoteAddress,
-        int RemotePort,
-        int OwningPid,
-        ulong CumBytesIn = 0,
-        ulong CumBytesOut = 0);
-
-    /// <summary>Returns all ESTABLISHED TCP connections (v4 + v6) with owning PID.</summary>
-    public static List<TcpConnectionRow> GetEstablishedConnections()
+    /// <summary>
+    /// All ESTABLISHED connections (v4 + v6) with PID. Returns false when reading
+    /// either table FAILED — callers must not treat that as "no connections".
+    /// </summary>
+    public static bool TryGetEstablishedConnections(out List<TcpConnectionRow> rows)
     {
-        var rows = new List<TcpConnectionRow>();
-        rows.AddRange(GetV4());
-        rows.AddRange(GetV6());
-        return rows;
-    }
-
-    private static IEnumerable<TcpConnectionRow> GetV4()
-    {
-        int size = 0;
-        GetExtendedTcpTable(IntPtr.Zero, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-        IntPtr buffer = Marshal.AllocHGlobal(size);
+        rows = new List<TcpConnectionRow>();
+        IntPtr v4 = IntPtr.Zero, v6 = IntPtr.Zero;
         try
         {
-            if (GetExtendedTcpTable(buffer, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
-                yield break;
-
-            int count = Marshal.ReadInt32(buffer);
-            IntPtr rowPtr = buffer + 4;                       // skip dwNumEntries
-            int rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
-
-            for (int i = 0; i < count; i++)
-            {
-                var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
-                rowPtr += rowSize;
-                if (row.dwState != MIB_TCP_STATE_ESTAB) continue;
-
-                var estatsRow = new MIB_TCPROW
-                {
-                    dwState = MIB_TCP_STATE_ESTAB,
-                    dwLocalAddr = row.dwLocalAddr,
-                    dwLocalPort = row.dwLocalPort,
-                    dwRemoteAddr = row.dwRemoteAddr,
-                    dwRemotePort = row.dwRemotePort
-                };
-                var (inBytes, outBytes) = TryReadEStatsV4(ref estatsRow);
-
-                yield return new TcpConnectionRow(
-                    new IPAddress(row.dwLocalAddr),
-                    SwapPort(row.dwLocalPort),
-                    new IPAddress(row.dwRemoteAddr),
-                    SwapPort(row.dwRemotePort),
-                    (int)row.dwOwningPid,
-                    inBytes,
-                    outBytes);
-            }
+            if (!TryReadTable(AF_INET, out v4)) return false;
+            if (!TryReadTable(AF_INET6, out v6)) return false;
+            rows.AddRange(ParseV4(v4));
+            rows.AddRange(ParseV6(v6));
+            return true;
         }
         finally
         {
-            Marshal.FreeHGlobal(buffer);
+            if (v4 != IntPtr.Zero) Marshal.FreeHGlobal(v4);
+            if (v6 != IntPtr.Zero) Marshal.FreeHGlobal(v6);
         }
     }
 
-    private static IEnumerable<TcpConnectionRow> GetV6()
+    /// <summary>
+    /// Probe size, allocate and fill — retrying when the table grew in between
+    /// (ERROR_INSUFFICIENT_BUFFER). buffer = Zero when there are no entries.
+    /// </summary>
+    private static bool TryReadTable(int family, out IntPtr buffer)
     {
-        int size = 0;
-        GetExtendedTcpTable(IntPtr.Zero, ref size, true, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
-        if (size == 0) yield break;
-        IntPtr buffer = Marshal.AllocHGlobal(size);
-        try
+        buffer = IntPtr.Zero;
+        for (int attempt = 0; attempt < 5; attempt++)
         {
-            if (GetExtendedTcpTable(buffer, ref size, true, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
-                yield break;
+            int size = 0;
+            GetExtendedTcpTable(IntPtr.Zero, ref size, true, family, TCP_TABLE_OWNER_PID_ALL, 0);
+            if (size == 0) return true;                       // empty table
 
-            int count = Marshal.ReadInt32(buffer);
-            IntPtr rowPtr = buffer + 4;
-            int rowSize = Marshal.SizeOf<MIB_TCP6ROW_OWNER_PID>();
+            size += 1024;                                     // slack for growth
+            buffer = Marshal.AllocHGlobal(size);
+            uint err = GetExtendedTcpTable(buffer, ref size, true, family, TCP_TABLE_OWNER_PID_ALL, 0);
+            if (err == NO_ERROR) return true;
 
-            for (int i = 0; i < count; i++)
-            {
-                var row = Marshal.PtrToStructure<MIB_TCP6ROW_OWNER_PID>(rowPtr);
-                rowPtr += rowSize;
-                if (row.dwState != MIB_TCP_STATE_ESTAB) continue;
-
-                var estatsRow = new MIB_TCP6ROW
-                {
-                    State = MIB_TCP_STATE_ESTAB,
-                    LocalAddr = row.ucLocalAddr,
-                    dwLocalScopeId = row.dwLocalScopeId,
-                    dwLocalPort = row.dwLocalPort,
-                    RemoteAddr = row.ucRemoteAddr,
-                    dwRemoteScopeId = row.dwRemoteScopeId,
-                    dwRemotePort = row.dwRemotePort
-                };
-                var (inBytes, outBytes) = TryReadEStatsV6(ref estatsRow);
-
-                yield return new TcpConnectionRow(
-                    new IPAddress(row.ucLocalAddr, row.dwLocalScopeId),
-                    SwapPort(row.dwLocalPort),
-                    new IPAddress(row.ucRemoteAddr, row.dwRemoteScopeId),
-                    SwapPort(row.dwRemotePort),
-                    (int)row.dwOwningPid,
-                    inBytes,
-                    outBytes);
-            }
-        }
-        finally
-        {
             Marshal.FreeHGlobal(buffer);
+            buffer = IntPtr.Zero;
+            if (err != ERROR_INSUFFICIENT_BUFFER) return false;
         }
+        return false;
+    }
+
+    private static List<TcpConnectionRow> ParseV4(IntPtr buffer)
+    {
+        var list = new List<TcpConnectionRow>();
+        if (buffer == IntPtr.Zero) return list;
+
+        int count = Marshal.ReadInt32(buffer);
+        IntPtr rowPtr = buffer + 4;                       // skip dwNumEntries
+        int rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
+
+        for (int i = 0; i < count; i++)
+        {
+            var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
+            rowPtr += rowSize;
+            if (row.dwState != MIB_TCP_STATE_ESTAB) continue;
+
+            var estatsRow = new MIB_TCPROW
+            {
+                dwState = MIB_TCP_STATE_ESTAB,
+                dwLocalAddr = row.dwLocalAddr,
+                dwLocalPort = row.dwLocalPort,
+                dwRemoteAddr = row.dwRemoteAddr,
+                dwRemotePort = row.dwRemotePort
+            };
+            var (inBytes, outBytes) = TryReadEStatsV4(ref estatsRow);
+
+            list.Add(new TcpConnectionRow(
+                new IPAddress(row.dwLocalAddr),
+                PortSwap.FromNetworkOrder(row.dwLocalPort),
+                new IPAddress(row.dwRemoteAddr),
+                PortSwap.FromNetworkOrder(row.dwRemotePort),
+                (int)row.dwOwningPid,
+                inBytes,
+                outBytes));
+        }
+        return list;
+    }
+
+    private static List<TcpConnectionRow> ParseV6(IntPtr buffer)
+    {
+        var list = new List<TcpConnectionRow>();
+        if (buffer == IntPtr.Zero) return list;
+
+        int count = Marshal.ReadInt32(buffer);
+        IntPtr rowPtr = buffer + 4;
+        int rowSize = Marshal.SizeOf<MIB_TCP6ROW_OWNER_PID>();
+
+        for (int i = 0; i < count; i++)
+        {
+            var row = Marshal.PtrToStructure<MIB_TCP6ROW_OWNER_PID>(rowPtr);
+            rowPtr += rowSize;
+            if (row.dwState != MIB_TCP_STATE_ESTAB) continue;
+
+            var estatsRow = new MIB_TCP6ROW
+            {
+                State = MIB_TCP_STATE_ESTAB,
+                LocalAddr = row.ucLocalAddr,
+                dwLocalScopeId = row.dwLocalScopeId,
+                dwLocalPort = row.dwLocalPort,
+                RemoteAddr = row.ucRemoteAddr,
+                dwRemoteScopeId = row.dwRemoteScopeId,
+                dwRemotePort = row.dwRemotePort
+            };
+            var (inBytes, outBytes) = TryReadEStatsV6(ref estatsRow);
+
+            list.Add(new TcpConnectionRow(
+                new IPAddress(row.ucLocalAddr, row.dwLocalScopeId),
+                PortSwap.FromNetworkOrder(row.dwLocalPort),
+                new IPAddress(row.ucRemoteAddr, row.dwRemoteScopeId),
+                PortSwap.FromNetworkOrder(row.dwRemotePort),
+                (int)row.dwOwningPid,
+                inBytes,
+                outBytes));
+        }
+        return list;
     }
 
     // Enables ESTATS data collection on the connection (idempotent) and reads
@@ -315,12 +333,5 @@ public static class IpHlpApi
             finally { Marshal.FreeHGlobal(rodPtr); }
         }
         catch { return (0, 0); }
-    }
-
-    // Ports arrive in network byte order in the low 16 bits of a uint.
-    private static int SwapPort(uint port)
-    {
-        uint p = port & 0xFFFF;
-        return (int)(((p & 0xFF) << 8) | ((p >> 8) & 0xFF));
     }
 }

@@ -1,72 +1,73 @@
 using System.Text.Json;
-using System.Text.Json.Serialization;
-using SecAgent.Service.Models;
 
 namespace SecAgent.Service.Analysis;
 
-/// <summary>
-/// Maintains a single progress.json file that the Tray app watches to render
-/// live progress (tooltip + busy icon + transition toast) during scan and
-/// Claude analysis. The file is deleted when work completes (idle state).
-/// </summary>
-public class ProgressTracker
+public interface IProgressTracker
 {
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        WriteIndented = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+    void BeginScan(string trigger);
+    void EndScanBeginAnalysis(string scanFile, string model, string trigger);
+    void Clear();
+}
 
+/// <summary>
+/// Mantém <c>progress.json</c>, observado pelo Tray para o tooltip/ícone "busy"
+/// e o toast de transição. O arquivo é removido ao terminar (estado ocioso).
+/// </summary>
+public class ProgressTracker : IProgressTracker
+{
     private readonly ILogger<ProgressTracker> _logger;
+    private readonly TimeProvider _time;
     private readonly string _path;
     private readonly object _lock = new();
     private DateTime _scanStartedUtc;
 
-    public ProgressTracker(ILogger<ProgressTracker> logger)
+    public ProgressTracker(ILogger<ProgressTracker> logger, AgentPaths paths, TimeProvider time)
     {
         _logger = logger;
-        var dir = @"C:\ProgramData\SecAgent";
-        Directory.CreateDirectory(dir);
-        _path = Path.Combine(dir, "progress.json");
-        // Clean any stale file from a previous run (service was killed mid-work).
+        _time = time;
+        _path = paths.ProgressFile;
+        // Limpa arquivo velho de uma execução anterior (serviço morto no meio do trabalho).
         TryDelete();
     }
 
     public void BeginScan(string trigger)
     {
-        _scanStartedUtc = DateTime.UtcNow;
-        Write(new AnalysisProgress(
-            State: "scanning",
-            StartedAtUtc: _scanStartedUtc,
-            Step: "Coletando dados do sistema",
-            Trigger: trigger,
-            ScanFile: null));
+        lock (_lock)
+        {
+            _scanStartedUtc = _time.GetUtcNow().UtcDateTime;
+            Write(new AnalysisProgress(
+                State: AnalysisProgress.Scanning,
+                StartedAtUtc: _scanStartedUtc,
+                Step: "Coletando dados do sistema",
+                Trigger: trigger,
+                ScanFile: null));
+        }
     }
 
     public void EndScanBeginAnalysis(string scanFile, string model, string trigger)
     {
-        Write(new AnalysisProgress(
-            State: "analyzing",
-            StartedAtUtc: _scanStartedUtc,    // keep total elapsed from scan start
-            Step: $"Claude analisando (modelo={model})",
-            Trigger: trigger,
-            ScanFile: scanFile));
+        lock (_lock)
+        {
+            Write(new AnalysisProgress(
+                State: AnalysisProgress.Analyzing,
+                StartedAtUtc: _scanStartedUtc,    // mantém o tempo total desde o início do scan
+                Step: $"Claude analisando (modelo={model})",
+                Trigger: trigger,
+                ScanFile: scanFile));
+        }
     }
 
     public void Clear() => TryDelete();
 
     private void Write(AnalysisProgress p)
     {
-        lock (_lock)
+        try
         {
-            try
-            {
-                File.WriteAllText(_path, JsonSerializer.Serialize(p, JsonOpts));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to write progress.json");
-            }
+            AtomicFile.WriteAllText(_path, JsonSerializer.Serialize(p, JsonDefaults.Indented));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to write progress.json");
         }
     }
 

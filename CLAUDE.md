@@ -9,9 +9,11 @@ assinatura Pro/Max via OAuth, não API) para análise estruturada.
 
 | Projeto | Tipo | Identidade | Função |
 |---|---|---|---|
+| `SecAgent.Contracts` | Class library (net8.0) | — | Contrato de IPC compartilhado: modelos JSON, `AgentPaths`, `TriggerNames`, `AiModels`, `SeverityLevels`, `ReportNames`, `AtomicFile`, `JsonDefaults` |
 | `SecAgent.Service` | Worker Service (.NET 8) | LocalSystem | Toda a lógica de coleta, monitores, Claude e persistência |
-| `SecAgent.Tray` | WinForms (.NET 8) | usuário logado | NotifyIcon + menu + toast notifications |
-| `SecAgent.Spike` | Worker Service (descartável) | LocalSystem | Histórico — validou auth do Claude. **Não deployar.** |
+| `SecAgent.Tray` | WinForms (.NET 8) | usuário logado | NotifyIcon + menu + toast notifications + painel WebView2 |
+| `SecAgent.Service.Tests` | xUnit | — | Testes do Service + Contracts (gate de cobertura 80%) |
+| `SecAgent.Tray.Tests` | xUnit | — | Testes do Tray (gate de cobertura 80%) |
 | `SecAgent.Installer` | Inno Setup (`.iss` + `.ps1`) | — | Gera `SecAgent-Setup.exe` (self-contained) que instala Service+Tray, registra o serviço e configura o token do Claude. Ver `SecAgent.Installer\CLAUDE.md`. |
 
 Cada projeto tem seu próprio `CLAUDE.md` com detalhes. Este aqui cobre o que
@@ -22,6 +24,13 @@ Cada projeto tem seu próprio `CLAUDE.md` com detalhes. Este aqui cobre o que
 **Apenas via arquivos em `C:\ProgramData\SecAgent\`** — sem named pipes, sem
 sockets. Service roda como LocalSystem, Tray como usuário; o file-based IPC
 evita complexidade de permissões cross-session.
+
+O **contrato** (schemas, nomes de arquivo, caminhos) mora em `SecAgent.Contracts`
+e é referenciado pelos dois lados — não duplique modelos nem caminhos
+(`AgentPaths`, `ReportNames`, `TriggerNames`). Arquivos que o outro lado relê
+(status/progress/network/blocked) são gravados com `AtomicFile.WriteAllText`
+(tmp + `File.Move`), que no Windows chega aos watchers como **`Renamed`** — todo
+`FileSystemWatcher` desses arquivos precisa assinar `Renamed`.
 
 | Arquivo | Direção | Conteúdo |
 |---|---|---|
@@ -50,7 +59,7 @@ Env var **Machine scope** `CLAUDE_CODE_OAUTH_TOKEN` (formato `sk-ant-oat01-...`)
 Service (LocalSystem) lê do registro de máquina.
 
 - Gerar token: `claude setup-token` (interativo, abre browser).
-- Salvar: `SecAgent.Spike\update-token.ps1` (admin) — usa `Read-Host
+- Salvar: `SecAgent.Service\update-token.ps1` (admin) — usa `Read-Host
   -AsSecureString` (não ecoa).
 - Verificar: `[Environment]::GetEnvironmentVariable('CLAUDE_CODE_OAUTH_TOKEN','Machine')`
 
@@ -67,8 +76,8 @@ Service (LocalSystem) lê do registro de máquina.
    Se mudar coletores, reavaliar tamanho do prompt.
 4. **Deploy invalida triggers** — `deploy.ps1` para o serviço, mas triggers
    em `triggers/` ficam. Service drena órfãos no startup (debounce 30s).
-5. **Trace logging** em `C:\ProgramData\SecAgent\trace.log` (escrito por
-   `ScanRunner` e `ClaudeAnalyzer`) é a melhor janela de debug do pipeline
+5. **Trace logging** em `C:\ProgramData\SecAgent\trace.log` (via `ITraceLog`,
+   usado pelo `ClaudeAnalyzer`) é a melhor janela de debug do pipeline
    scan→Claude. EventLog do Windows só pega Warning+ do framework.
 6. **Análise com IA é manual por padrão** — `Claude.AnalyzeAfterScan=false` e
    `Monitors.IncidentAutoAnalysisEnabled=false`. O scan diário roda **grátis**
@@ -77,23 +86,42 @@ Service (LocalSystem) lê do registro de máquina.
    Para religar a IA automática, ponha essas flags em `true`. Custo por análise
    manual: ~$0.08-0.12 equiv (scan) / ~$0.025 (incidente).
 
+## Testes e cobertura (TDD)
+
+```powershell
+dotnet test SecAgent.slnx                              # todos os testes
+dotnet test SecAgent.slnx -p:CollectCoverage=true      # + gate: falha se < 80% de linhas por projeto
+dotnet tool restore
+dotnet reportgenerator "-reports:**/TestResults/coverage.cobertura.xml" "-targetdir:coverage-report"
+```
+
+- CI (`.github/workflows/ci.yml`, windows-latest) roda o gate em todo PR.
+- **Bug novo = teste `Bug_<descrição>` vermelho primeiro**, depois o fix.
+- Dependências de SO ficam atrás de interfaces (`SecAgent.Service\Platform\`,
+  `TimeProvider`, `AgentPaths`); a lógica fica em classes puras testáveis
+  (`internal` + `InternalsVisibleTo` para os projetos de teste).
+- **`[ExcludeFromCodeCoverage]` só em adapters finos de SO/UI sem lógica**
+  (WMI, COM, registro, P/Invoke, Process, EventLogWatcher, Forms/NotifyIcon).
+  Se o adapter ganhou um `if`, extraia a regra para uma classe testada.
+- Testes de arquivo usam diretório temporário (`TempDir`) e `FakeTimeProvider`.
+
 ## Build commands
 
 ```powershell
-# Build (sem deploy)
-dotnet build C:\Projetos\SecAgent\SecAgent.sln
+# Build (sem deploy) — .slnx exige SDK >= 9.0.200 (projetos seguem net8.0)
+dotnet build SecAgent.slnx
 
 # Build apenas um projeto
-cd C:\Projetos\SecAgent\SecAgent.Service ; dotnet build
+cd SecAgent.Service ; dotnet build
 
 # Rodar Service em modo console (debug, requer admin para Security log)
 Stop-Service SecAgent  # admin
-cd C:\Projetos\SecAgent\SecAgent.Service
+cd SecAgent.Service
 $env:CLAUDE_CODE_OAUTH_TOKEN = [Environment]::GetEnvironmentVariable('CLAUDE_CODE_OAUTH_TOKEN','User')
 dotnet run
 
 # Rodar Tray em foreground
-cd C:\Projetos\SecAgent\SecAgent.Tray ; dotnet run
+cd SecAgent.Tray ; dotnet run
 ```
 
 ## Runtime data

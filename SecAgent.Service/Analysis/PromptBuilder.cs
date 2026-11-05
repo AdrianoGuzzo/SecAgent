@@ -64,6 +64,45 @@ public static class PromptBuilder
         return Template.Replace("{SCAN_JSON}", scanJson);
     }
 
+    /// <summary>
+    /// Prompt da análise de incidente. Obs.: descrições/command lines de eventos
+    /// são dados controláveis por um atacante (prompt injection); o dano é
+    /// limitado porque o CLI roda com <c>--disallowedTools "*"</c>.
+    /// </summary>
+    public static string BuildIncident(IReadOnlyList<SecurityEvent> events, DateTime start, DateTime end)
+    {
+        var minutes = (end - start).TotalMinutes;
+        var slim = events.Select(e => new
+        {
+            t = e.TimestampUtc,
+            src = e.Source,
+            sev = e.Severity,
+            title = e.Title,
+            desc = e.Description,
+            details = e.Details
+        }).ToList();
+        var eventsJson = JsonSerializer.Serialize(slim, JsonOpts);
+
+        return $$"""
+            O agente local detectou {{events.Count}} evento(s) suspeito(s) em um sistema Windows
+            na janela {{start:yyyy-MM-dd HH:mm:ss}} UTC -> {{end:yyyy-MM-dd HH:mm:ss}} UTC
+            ({{minutes:F0}} min). Analise se há evidência de ataque coordenado, atividade
+            suspeita, ou se são alarmes falsos. Considere correlações entre os eventos
+            (mesmo processo pai, sequência temporal, mesmo IP, etc.).
+
+            Responda APENAS com um único bloco JSON válido (sem markdown, sem texto antes/depois):
+            {
+              "severity": "info|low|medium|high|critical",
+              "title": "Título curto da incidência (até 80 chars)",
+              "summary": "2-4 frases avaliando se isto é ataque, atividade suspeita, ou normal",
+              "recommended_actions": ["ação 1", "ação 2", "..."]
+            }
+
+            Eventos (JSON):
+            {{eventsJson}}
+            """;
+    }
+
     // Publishers whose entries are almost always uninteresting system components
     // (drivers, OS bundled apps). They are summarized to a count instead of listed.
     private static readonly HashSet<string> SystemPublishers = new(StringComparer.OrdinalIgnoreCase)
@@ -79,17 +118,15 @@ public static class PromptBuilder
 
     /// <summary>
     /// Reduces the scan payload before sending to Claude:
-    /// - Groups TCP/UDP listeners by port (collapsing per-interface duplicates)
+    /// - Groups TCP listeners by port (collapsing per-interface duplicates).
+    ///   UDP listeners are dominated by short-lived sockets (mDNS, SSDP,
+    ///   ephemeral ports) that blow the prompt past the 200K token limit, so
+    ///   only their count is kept.
     /// - Pre-correlates each port with matching Windows Firewall inbound rules
     /// - Drops uninteresting system software, keeping only a count
     /// - Drops full ACE lists for folders without concerns
-    /// - Strips noisy fields (InstallDate, ACE for healthy folders)
     /// </summary>
-    // UDP listeners are dominated by short-lived application sockets (mDNS, SSDP,
-    // ephemeral source ports) that don't represent exposed services. Including
-    // them blows the prompt past the 200K token limit. Keep TCP only — that's
-    // where the actual exposure question lives.
-    private static ScanSummary Summarize(ScanResult s)
+    internal static ScanSummary Summarize(ScanResult s)
     {
         var groupedPorts = s.OpenPorts
             .Where(p => p.Protocol.Equals("TCP", StringComparison.OrdinalIgnoreCase))
@@ -133,11 +170,12 @@ public static class PromptBuilder
     }
 
     /// <summary>
-    /// Collapses IPv6 link-locals into a single "[IPv6]" marker and dedupes.
-    /// Keeps full info for the canonical "any" addresses (0.0.0.0, ::, 127.0.0.1)
-    /// and explicit non-loopback IPv4s.
+    /// Collapses the remaining IPv6 addresses into a single "[IPv6:other]" marker
+    /// and dedupes. Keeps the well-known IPv6 "any" (::) and loopback (::1) as-is —
+    /// collapsing ::1 made a loopback-only listener look exposed to the network.
+    /// IPv4 addresses are always kept.
     /// </summary>
-    private static List<string> CompactAddresses(IEnumerable<string> addrs)
+    internal static List<string> CompactAddresses(IEnumerable<string> addrs)
     {
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         bool hasV6 = false;
@@ -145,8 +183,7 @@ public static class PromptBuilder
         {
             if (a.Contains(':'))
             {
-                // IPv6: collapse all into one marker except the well-known "::"
-                if (a == "::") result.Add("::");
+                if (a is "::" or "::1") result.Add(a);
                 else hasV6 = true;
             }
             else
@@ -205,9 +242,7 @@ public static class PromptBuilder
             matched.Add(new MatchedRule(
                 r.Name,
                 r.Action,
-                r.RemoteAddresses.Length > MaxRemoteAddressesChars
-                    ? r.RemoteAddresses[..MaxRemoteAddressesChars] + "..."
-                    : r.RemoteAddresses,
+                r.RemoteAddresses.Truncate(MaxRemoteAddressesChars),
                 r.Profiles));
 
             if (matched.Count >= MaxMatchedRulesPerPort) break;
@@ -215,7 +250,7 @@ public static class PromptBuilder
         return matched.Count > 0 ? matched : null;
     }
 
-    private static bool PortInRange(int port, string spec)
+    internal static bool PortInRange(int port, string spec)
     {
         if (string.IsNullOrWhiteSpace(spec)) return false;
 

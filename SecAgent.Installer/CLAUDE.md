@@ -31,8 +31,9 @@ publish/              # binarios publicados Service/ e Tray/ (gitignored)
 ```
 
 O script publica `SecAgent.Service` e `SecAgent.Tray` com
-`-r win-x64 --self-contained true` (≈70MB cada) e chama o ISCC. O
-`SecAgent.Spike` **não** entra (descartável).
+`-r win-x64 --self-contained true` (≈70MB cada) e chama o ISCC.
+`SecAgent.Contracts` entra como dependência dos dois; os projetos de teste
+não entram.
 
 ## O que o instalador faz (em runtime, como admin/UAC)
 

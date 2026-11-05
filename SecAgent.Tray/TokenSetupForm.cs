@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using SecAgent.Tray.Core;
 
 namespace SecAgent.Tray;
 
@@ -12,6 +14,7 @@ namespace SecAgent.Tray;
 /// lacks — so <see cref="SaveTokenElevated"/> spawns one elevated PowerShell
 /// (single UAC prompt), mirroring update-token.ps1.
 /// </summary>
+[ExcludeFromCodeCoverage(Justification = "Glue de WinForms; script/linhas de comando em Core.TokenCommands")]
 public sealed class TokenSetupForm : Form
 {
     private readonly TextBox _claudePath;
@@ -142,7 +145,7 @@ public sealed class TokenSetupForm : Form
             Process.Start(new ProcessStartInfo
             {
                 FileName = "cmd.exe",
-                Arguments = $"/k \"\"{claude}\" setup-token\"",
+                Arguments = ClaudeSetupCommand.CmdArguments(claude),
                 UseShellExecute = true
             });
         }
@@ -222,20 +225,11 @@ public sealed class TokenSetupForm : Form
             }
             catch { /* best effort — ACL hardening only */ }
 
-            var escaped = tempFile.Replace("'", "''");
-            var script =
-                $"$f='{escaped}'; " +
-                "$t=(Get-Content -LiteralPath $f -Raw).Trim(); " +
-                "Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue; " +
-                $"[Environment]::SetEnvironmentVariable('{TokenSetup.TokenVar}',$t,'Machine'); " +
-                $"[Environment]::SetEnvironmentVariable('{TokenSetup.TokenVar}',$t,'User'); " +
-                "Restart-Service SecAgent -ErrorAction SilentlyContinue";
-
             var psi = new ProcessStartInfo
             {
                 FileName = "powershell.exe",
-                Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"" +
-                            script.Replace("\"", "\\\"") + "\"",
+                Arguments = TokenSaveScriptBuilder.PowerShellArguments(
+                    TokenSaveScriptBuilder.Build(tempFile, TokenSetup.TokenVar)),
                 UseShellExecute = true,
                 Verb = "runas",
                 WindowStyle = ProcessWindowStyle.Hidden
@@ -255,11 +249,19 @@ public sealed class TokenSetupForm : Form
                 return false;
             }
 
-            proc.WaitForExit();
-            if (proc.ExitCode != 0)
+            int exitCode;
+            using (proc)
             {
+                proc.WaitForExit();
+                exitCode = proc.ExitCode;
+            }
+            if (exitCode != 0)
+            {
+                // O token anterior permanece intacto (o script só grava após validar).
                 MessageBox.Show(this,
-                    "O salvamento elevado terminou com erro (código " + proc.ExitCode + ").",
+                    exitCode == TokenSaveScriptBuilder.ExitInvalidToken
+                        ? "O token não pôde ser lido pelo processo elevado. Nada foi alterado."
+                        : "O salvamento elevado terminou com erro (código " + exitCode + "). Nada foi alterado.",
                     "SecAgent", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }

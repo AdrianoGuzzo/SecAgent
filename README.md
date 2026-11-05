@@ -24,7 +24,7 @@ cada finding explica **por que** algo é risco, não só o que fazer.
 |     |                |              [EventLogMonitor]  push          |
 |     v                v                       |                       |
 |     [ScanRunner] --> SecurityScanner        v                        |
-|       |              7 collectors    Channel<SecurityEvent>          |
+|       |              8 collectors    Channel<SecurityEvent>          |
 |       |              (incl. FirewallRulesCollector)                  |
 |       |                                      |                       |
 |       v                                      v                       |
@@ -320,9 +320,8 @@ Cole o token quando pedido (não vai ser ecoado — usa `Read-Host -AsSecureStri
 O script salva em escopo **User** e **Machine** (necessário porque o serviço
 roda como LocalSystem).
 
-> **Nota:** o `update-token.ps1` está em `SecAgent.Spike\` no histórico inicial.
-> Para o serviço, pode usar o mesmo script — o que importa é a env var
-> `CLAUDE_CODE_OAUTH_TOKEN` estar setada em scope Machine.
+> **Nota:** o que importa é a env var `CLAUDE_CODE_OAUTH_TOKEN` estar setada
+> em scope Machine. O script reinicia o serviço `SecAgent` se ele existir.
 
 #### 3. Deployar o serviço (publish + install em uma só passada)
 
@@ -444,14 +443,27 @@ Editar em `C:\Projetos\SecAgent\SecAgent.Service\bin\publish\appsettings.json`
 
 ### Código-fonte
 ```
-C:\Projetos\SecAgent\
-├── SecAgent.sln
+SecAgent\
+├── SecAgent.slnx                          <- solution (SDK >= 9.0.200; projetos net8.0)
 ├── README.md                              <- este arquivo
+├── .github\workflows\ci.yml               <- build + testes + gate de cobertura 80% por projeto
+│
+├── SecAgent.Contracts\                    <- contrato de IPC Service ↔ Tray
+│   ├── AgentPaths.cs                      <- C:\ProgramData\SecAgent + derivados
+│   ├── TriggerNames.cs, ReportNames.cs, AiModels.cs, SeverityLevels.cs
+│   ├── AtomicFile.cs, JsonDefaults.cs
+│   └── Models\                            <- AgentStatus, AnalysisProgress, AnalysisResult,
+│                                             SecurityEvent/IncidentReport, Network*, BlockedList
 │
 ├── SecAgent.Service\                      <- serviço (Worker + monitores)
-│   ├── Program.cs                         <- DI + AddWindowsService + Channel<SecurityEvent>
+│   ├── Program.cs                         <- fino: Host + AddSecAgentService
+│   ├── ServiceRegistration.cs             <- DI + options validadas + adapters
 │   ├── Worker.cs                          <- BackgroundService, agenda scans diários
-│   ├── SecurityScanner.cs                 <- orquestra os 7 coletores
+│   ├── SecurityScanner.cs                 <- orquestra os 8 coletores
+│   ├── Platform\                          <- interfaces + adapters finos de SO (WMI, COM, P/Invoke…)
+│   ├── Diagnostics\TraceLog.cs            <- ITraceLog → trace.log
+│   ├── Remediation\IpBlocker.cs           <- bloqueio/desbloqueio de IP no firewall
+│   ├── update-token.ps1                   <- grava CLAUDE_CODE_OAUTH_TOKEN (Machine) + reinicia
 │   ├── ScannerOptions.cs
 │   ├── StringExtensions.cs
 │   ├── appsettings.json
@@ -470,7 +482,9 @@ C:\Projetos\SecAgent\
 │   │   └── UserAccountsCollector.cs
 │   ├── Monitors\                          <- Fase 3
 │   │   ├── ProcessMonitor.cs              <- WMI Win32_Process
+│   │   ├── IpClassifier.cs                <- IP público vs. privado/especial
 │   │   ├── NetworkMonitor.cs              <- TCP poll + diff
+│   │   ├── NetworkSnapshotService.cs      <- network.json + alertas de entrada
 │   │   ├── EventLogMonitor.cs             <- EventLogWatcher Security/System
 │   │   ├── SuspiciousEventProcessor.cs    <- consumer do channel
 │   │   └── MonitorOptions.cs
@@ -478,13 +492,10 @@ C:\Projetos\SecAgent\
 │   │   ├── TriggerWatcher.cs              <- FSWatcher em triggers/*.trigger
 │   │   └── TriggerOptions.cs
 │   ├── Models\
-│   │   ├── ScanResult.cs                  <- Fase 1 + 4.2 (FirewallRule)
-│   │   ├── AnalysisResult.cs              <- Fase 2 (scan analysis)
-│   │   ├── SecurityEvent.cs               <- Fase 3 (event + incident report)
-│   │   ├── AgentStatus.cs                 <- Fase 4 (status.json schema)
-│   │   └── AnalysisProgress.cs            <- Fase 4.3 (progress.json schema)
+│   │   └── ScanResult.cs                  <- Fase 1 + 4.2 (FirewallRule); só o Service usa
 │   ├── Analysis\
 │   │   ├── ClaudeAnalyzer.cs              <- AnalyzeAsync + AnalyzeIncidentAsync
+│   │   ├── ClaudeArgsBuilder.cs, ClaudeResponseParser.cs, ReportMarkdownRenderer.cs
 │   │   ├── ClaudeOptions.cs
 │   │   ├── PromptBuilder.cs               <- token reduction + firewall correlation (4.2)
 │   │   ├── StatusFileService.cs           <- Fase 4 - escreve status.json
@@ -494,18 +505,27 @@ C:\Projetos\SecAgent\
 │
 ├── SecAgent.Tray\                         <- Fase 4: app de bandeja (user-mode)
 │   ├── Program.cs
-│   ├── TrayApplicationContext.cs          <- NotifyIcon, menu, watchers (status, reports, scans, progress)
-│   ├── AgentStatus.cs                     <- mirror do schema do service
-│   ├── AnalysisProgress.cs                <- Fase 4.3 mirror
+│   ├── TrayApplicationContext.cs          <- NotifyIcon, menu, watchers (glue fino)
+│   ├── DashboardForm.cs, DataPump.cs      <- painel WebView2 + leitura dos arquivos do Service
+│   ├── GeoLookup.cs                       <- país/cidade/ISP por IP (cache + rate limit)
+│   ├── Core\                              <- lógica pura e testada (ícone, toasts, triggers, tail…)
+│   ├── Assets\                            <- dashboard.html + css + js (embedded)
 │   ├── install-tray.ps1                   <- registra HKCU\...\Run, sem admin
 │   ├── uninstall-tray.ps1
 │   └── bin\publish\
 │       └── SecAgent.Tray.exe
 │
-└── SecAgent.Spike\                        <- spike histórico (Fase 0, descartável)
-    ├── register-service.ps1
-    ├── unregister-service.ps1
-    └── update-token.ps1                   <- gerencia env var CLAUDE_CODE_OAUTH_TOKEN
+├── SecAgent.Service.Tests\                <- xUnit; gate 80% (Service + Contracts)
+├── SecAgent.Tray.Tests\                   <- xUnit; gate 80% (Tray)
+└── SecAgent.Installer\                    <- Inno Setup → SecAgent-Setup.exe
+```
+
+### Testes e cobertura
+```powershell
+dotnet test SecAgent.slnx                            # todos os testes
+dotnet test SecAgent.slnx -p:CollectCoverage=true    # falha se < 80% de linhas em cada projeto
+dotnet tool restore
+dotnet reportgenerator "-reports:**/TestResults/coverage.cobertura.xml" "-targetdir:coverage-report"
 ```
 
 ### Runtime data (gerado em tempo de execução)
@@ -577,7 +597,7 @@ depois `Restart-Service SecAgent` (admin).
 # 1. gerar novo token (interativo, abre browser)
 claude setup-token
 # 2. salvar em User + Machine scope (admin)
-powershell -ExecutionPolicy Bypass -File C:\Projetos\SecAgent\SecAgent.Spike\update-token.ps1
+powershell -ExecutionPolicy Bypass -File C:\Projetos\SecAgent\SecAgent.Service\update-token.ps1
 # 3. reiniciar o serviço para pegar a nova env var (admin)
 Restart-Service SecAgent
 ```
@@ -635,7 +655,7 @@ Pontos a considerar:
 ## Roadmap
 
 **Fases concluídas:**
-- **Fase 1** — Scanner de configuração (7 coletores) ✓
+- **Fase 1** — Scanner de configuração (8 coletores) ✓
 - **Fase 2** — Integração com Claude (análise diária, otimização tokens) ✓
 - **Fase 3** — Monitoramento em tempo real (process / network / event log) ✓
 - **Fase 4** — Tray icon + toast notifications + status.json ✓

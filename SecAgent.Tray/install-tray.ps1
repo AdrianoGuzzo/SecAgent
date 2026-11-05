@@ -6,7 +6,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$projectDir = 'C:\Projetos\SecAgent\SecAgent.Tray'
+$projectDir = $PSScriptRoot   # funciona em qualquer clone/worktree
 $exePath = Join-Path $projectDir 'bin\publish\SecAgent.Tray.exe'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $valueName = 'SecAgentTray'

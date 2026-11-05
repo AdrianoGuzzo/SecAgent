@@ -12,6 +12,7 @@ namespace SecAgent.Tray;
 /// desinstalação completa (todos os usuários) é feita em "Aplicativos e
 /// recursos" do Windows (requer admin).
 /// </summary>
+[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage(Justification = "Adapter fino do registro HKCU")]
 internal static class UserInstall
 {
     private const string SettingsKey = @"Software\SecAgent";

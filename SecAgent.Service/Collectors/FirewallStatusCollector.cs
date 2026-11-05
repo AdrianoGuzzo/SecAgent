@@ -1,29 +1,36 @@
-using System.Management;
 using SecAgent.Service.Models;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Collectors;
 
+/// <summary>Estado dos perfis do firewall via WMI <c>MSFT_NetFirewallProfile</c>.</summary>
 public class FirewallStatusCollector
 {
+    private readonly IWmiQuery _wmi;
+
+    public FirewallStatusCollector(IWmiQuery wmi) => _wmi = wmi;
+
     public FirewallStatus Collect()
     {
         ProfileStatus? domain = null, priv = null, pub = null;
 
-        using var searcher = new ManagementObjectSearcher(
-            @"root\StandardCimv2",
-            "SELECT Name, Enabled, DefaultInboundAction, DefaultOutboundAction FROM MSFT_NetFirewallProfile");
-
-        foreach (ManagementObject obj in searcher.Get())
+        foreach (var obj in _wmi.Query(@"root\StandardCimv2",
+                     "SELECT Name, Enabled, DefaultInboundAction, DefaultOutboundAction FROM MSFT_NetFirewallProfile"))
         {
-            var name = obj["Name"] as string ?? "";
-            var enabled = obj["Enabled"] is ushort u ? u == 1 : (obj["Enabled"] as bool? ?? false);
-            var inbound = obj["DefaultInboundAction"]?.ToString();
-            var outbound = obj["DefaultOutboundAction"]?.ToString();
-            var status = new ProfileStatus(enabled, inbound, outbound);
+            var name = WmiValues.GetString(obj, "Name") ?? "";
+            obj.TryGetValue("Enabled", out var enabledRaw);
+            obj.TryGetValue("DefaultInboundAction", out var inRaw);
+            obj.TryGetValue("DefaultOutboundAction", out var outRaw);
 
-            if (name.Equals("Domain", StringComparison.OrdinalIgnoreCase))   domain = status;
+            // Antes os defaults saíam como "0"/"2"/"4" crus — o Claude via números sem sentido.
+            var status = new ProfileStatus(
+                WmiValues.ParseGpoBoolean(enabledRaw),
+                WmiValues.MapFirewallDefaultAction(inRaw),
+                WmiValues.MapFirewallDefaultAction(outRaw));
+
+            if (name.Equals("Domain", StringComparison.OrdinalIgnoreCase)) domain = status;
             else if (name.Equals("Private", StringComparison.OrdinalIgnoreCase)) priv = status;
-            else if (name.Equals("Public", StringComparison.OrdinalIgnoreCase))  pub  = status;
+            else if (name.Equals("Public", StringComparison.OrdinalIgnoreCase)) pub = status;
         }
 
         return new FirewallStatus(domain, priv, pub);

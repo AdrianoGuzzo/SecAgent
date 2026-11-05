@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # .slnx exige SDK >= 9.0.200; os projetos continuam net8.0.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Restore
+        run: dotnet restore SecAgent.slnx
+
+      - name: Build
+        run: dotnet build SecAgent.slnx --no-restore -c Release
+
+      # Gate: cada projeto de teste falha se a cobertura de linhas < 80%
+      # (Threshold no .csproj de teste, via coverlet.msbuild).
+      - name: Test + coverage gate
+        run: dotnet test SecAgent.slnx --no-build -c Release -p:CollectCoverage=true
+
+      - name: Coverage report
+        if: always()
+        run: |
+          dotnet tool restore
+          dotnet reportgenerator "-reports:**/TestResults/coverage.cobertura.xml" "-targetdir:coverage-report" "-reporttypes:HtmlSummary;MarkdownSummaryGithub"
+          if (Test-Path coverage-report/SummaryGithub.md) { Get-Content coverage-report/SummaryGithub.md >> $env:GITHUB_STEP_SUMMARY }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage-report

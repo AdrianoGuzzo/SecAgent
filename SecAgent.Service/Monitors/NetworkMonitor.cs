@@ -1,9 +1,7 @@
 using System.Net;
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
-using SecAgent.Service.Models;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Monitors;
 
@@ -17,18 +15,24 @@ public class NetworkMonitor : BackgroundService
     private readonly ILogger<NetworkMonitor> _logger;
     private readonly ChannelWriter<SecurityEvent> _writer;
     private readonly MonitorOptions _opts;
+    private readonly INetworkInfo _net;
+    private readonly TimeProvider _time;
     private readonly HashSet<int> _portWhitelist;
     private HashSet<string> _previous = new();
 
     public NetworkMonitor(
         ILogger<NetworkMonitor> logger,
-        Channel<SecurityEvent> channel,
-        IOptions<MonitorOptions> opts)
+        ChannelWriter<SecurityEvent> writer,
+        IOptions<MonitorOptions> opts,
+        INetworkInfo net,
+        TimeProvider time)
     {
         _logger = logger;
-        _writer = channel.Writer;
+        _writer = writer;
         _opts = opts.Value;
-        _portWhitelist = new HashSet<int>(_opts.NetworkPortWhitelist);
+        _net = net;
+        _time = time;
+        _portWhitelist = new HashSet<int>(_opts.NetworkPortWhitelist ?? MonitorOptions.DefaultNetworkPortWhitelist.ToList());
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -40,101 +44,69 @@ public class NetworkMonitor : BackgroundService
         }
 
         _logger.LogInformation("NetworkMonitor started (poll every {Sec}s)", _opts.NetworkPollSeconds);
-        _previous = SnapshotConnections();        // baseline: don't fire on startup
+        try { _previous = SnapshotKeys(); }   // baseline: não dispara no startup
+        catch (Exception ex) { _logger.LogWarning(ex, "NetworkMonitor baseline failed"); }
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(_opts.NetworkPollSeconds), stoppingToken); }
+            try { await Task.Delay(TimeSpan.FromSeconds(_opts.NetworkPollSeconds), _time, stoppingToken); }
             catch (OperationCanceledException) { break; }
 
-            try
-            {
-                var current = SnapshotConnections();
-                foreach (var conn in current)
-                {
-                    if (_previous.Contains(conn)) continue;
-                    if (!TryParseConnection(conn, out var localEp, out var remoteEp)) continue;
-
-                    if (!IsPublicAddress(remoteEp!.Address)) continue;
-                    if (_portWhitelist.Contains(remoteEp.Port)) continue;
-
-                    var evt = new SecurityEvent(
-                        TimestampUtc: DateTime.UtcNow,
-                        Source: "network",
-                        Severity: "low",
-                        Title: $"New outbound connection to {remoteEp.Address}:{remoteEp.Port}",
-                        Description: "New TCP connection established to a public IP on a non-whitelisted port. Could be legitimate app traffic or unauthorized exfiltration.",
-                        Details: new Dictionary<string, string>
-                        {
-                            ["localEndpoint"] = localEp?.ToString() ?? "",
-                            ["remoteEndpoint"] = remoteEp.ToString(),
-                            ["remoteAddress"] = remoteEp.Address.ToString(),
-                            ["remotePort"] = remoteEp.Port.ToString()
-                        });
-                    _writer.TryWrite(evt);
-                }
-                _previous = current;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "NetworkMonitor poll failed");
-            }
+            try { Poll(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "NetworkMonitor poll failed"); }
         }
     }
 
-    private static HashSet<string> SnapshotConnections()
+    /// <summary>Um ciclo: compara com o snapshot anterior e emite eventos das conexões novas.</summary>
+    internal void Poll()
     {
-        var props = IPGlobalProperties.GetIPGlobalProperties();
-        var set = new HashSet<string>();
-        foreach (var c in props.GetActiveTcpConnections())
+        var current = SnapshotKeys();
+        foreach (var (local, remote) in NewPublicOutbound(_previous, current, _portWhitelist))
         {
-            if (c.State != TcpState.Established) continue;
-            set.Add($"{c.LocalEndPoint}|{c.RemoteEndPoint}");
+            _writer.TryWrite(new SecurityEvent(
+                TimestampUtc: _time.GetUtcNow().UtcDateTime,
+                Source: "network",
+                Severity: SeverityLevels.Low,
+                Title: $"New outbound connection to {remote.Address}:{remote.Port}",
+                Description: "New TCP connection established to a public IP on a non-whitelisted port. Could be legitimate app traffic or unauthorized exfiltration.",
+                Details: new Dictionary<string, string>
+                {
+                    ["localEndpoint"] = local.ToString(),
+                    ["remoteEndpoint"] = remote.ToString(),
+                    ["remoteAddress"] = remote.Address.ToString(),
+                    ["remotePort"] = remote.Port.ToString()
+                }));
         }
-        return set;
+        _previous = current;
     }
 
-    private static bool TryParseConnection(string key, out IPEndPoint? local, out IPEndPoint? remote)
+    private HashSet<string> SnapshotKeys()
+        => _net.GetEstablishedTcp().Select(c => Key(c.Local, c.Remote)).ToHashSet();
+
+    internal static string Key(IPEndPoint local, IPEndPoint remote) => $"{local}|{remote}";
+
+    /// <summary>Conexões presentes em <paramref name="current"/> e não em <paramref name="previous"/>, para IP público fora do whitelist.</summary>
+    internal static IEnumerable<(IPEndPoint Local, IPEndPoint Remote)> NewPublicOutbound(
+        IReadOnlySet<string> previous, IEnumerable<string> current, IReadOnlySet<int> portWhitelist)
     {
-        local = null; remote = null;
+        foreach (var key in current)
+        {
+            if (previous.Contains(key)) continue;
+            if (!TryParseKey(key, out var local, out var remote)) continue;
+            if (!IpClassifier.IsPublic(remote.Address)) continue;
+            if (portWhitelist.Contains(remote.Port)) continue;
+            yield return (local, remote);
+        }
+    }
+
+    internal static bool TryParseKey(string key, out IPEndPoint local, out IPEndPoint remote)
+    {
+        local = remote = new IPEndPoint(IPAddress.None, 0);
         var parts = key.Split('|');
         if (parts.Length != 2) return false;
-        try
-        {
-            local = IPEndPoint.Parse(parts[0]);
-            remote = IPEndPoint.Parse(parts[1]);
-            return true;
-        }
-        catch { return false; }
-    }
-
-    public static bool IsPublicAddress(IPAddress addr)
-    {
-        if (IPAddress.IsLoopback(addr)) return false;
-
-        if (addr.AddressFamily == AddressFamily.InterNetwork)
-        {
-            var b = addr.GetAddressBytes();
-            // 10.0.0.0/8
-            if (b[0] == 10) return false;
-            // 172.16.0.0/12
-            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return false;
-            // 192.168.0.0/16
-            if (b[0] == 192 && b[1] == 168) return false;
-            // 169.254.0.0/16 (link-local APIPA)
-            if (b[0] == 169 && b[1] == 254) return false;
-            // 100.64.0.0/10 (CGNAT)
-            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return false;
-            return true;
-        }
-        if (addr.AddressFamily == AddressFamily.InterNetworkV6)
-        {
-            if (addr.IsIPv6LinkLocal || addr.IsIPv6SiteLocal) return false;
-            var b = addr.GetAddressBytes();
-            // fc00::/7 unique-local
-            if ((b[0] & 0xfe) == 0xfc) return false;
-            return true;
-        }
-        return false;
+        if (!IPEndPoint.TryParse(parts[0], out var l) || !IPEndPoint.TryParse(parts[1], out var r)) return false;
+        local = l;
+        remote = r;
+        return true;
     }
 }

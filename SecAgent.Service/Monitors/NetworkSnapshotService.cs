@@ -1,70 +1,66 @@
-using System.Diagnostics;
-using System.Net;
 using System.Net.NetworkInformation;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
-using SecAgent.Service.Models;
-using SecAgent.Service.Monitors.Native;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Monitors;
 
 /// <summary>
 /// Periodically enumerates ALL established TCP connections (with owning process)
-/// and writes a network.json snapshot for the Tray dashboard to render a live
-/// connections table. Unlike the legacy NetworkMonitor (outbound diff only),
-/// this also classifies inbound connections and — when enabled — emits a
-/// SecurityEvent for each NEW inbound connection from a public IP, so external
-/// access (RDP/SMB/etc.) flows into the existing incident/Claude pipeline.
+/// and writes a network.json snapshot for the Tray dashboard. Also classifies
+/// inbound connections and — when enabled — emits a SecurityEvent plus an
+/// immediate alert file for each NEW inbound connection from a public IP.
+///
+/// Robustez:
+///  - Uma leitura FALHA da tabela TCP (null) mantém o estado anterior. Antes ela
+///    virava "lista vazia" e no ciclo seguinte todas as conexões de entrada
+///    existentes eram re-alertadas.
+///  - Sem baseline (falhou no startup), o primeiro ciclo bem-sucedido vira o
+///    baseline em vez de alertar tudo que já existia.
+///  - O cooldown de alerta por IP é podado (antes crescia sem limite).
 /// </summary>
 public class NetworkSnapshotService : BackgroundService
 {
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        WriteIndented = false,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
-
     private readonly ILogger<NetworkSnapshotService> _logger;
     private readonly ChannelWriter<SecurityEvent> _writer;
     private readonly MonitorOptions _opts;
+    private readonly ITcpConnectionSource _tcp;
+    private readonly INetworkInfo _net;
+    private readonly TimeProvider _time;
     private readonly HashSet<int> _inboundPortWhitelist;
     private readonly HashSet<int> _sensitivePorts;
     private readonly List<string> _selfFragments;
     private readonly Dictionary<string, DateTime> _lastAlertPerIp = new();
-    private readonly object _alertLock = new();
-    private HashSet<string> _seenInbound = new();
+    private HashSet<string>? _seenInbound;   // null = ainda sem baseline
     private int _alertSeq;
 
-    // Per-connection cumulative byte counters from the previous cycle, keyed by
-    // 4-tuple, so we can derive a current throughput (bytes/s) by diffing.
+    // Contadores cumulativos do ciclo anterior (por 4-tupla e por NIC) para
+    // derivar bytes/s por diferença.
     private Dictionary<string, ulong> _prevBytes = new();
+    private Dictionary<string, (ulong Rx, ulong Tx)> _prevIfaceBytes = new();
     private DateTime _lastCycleUtc;
-
-    // Per-interface cumulative byte counters from the previous cycle, keyed by
-    // NetworkInterface.Id, so we can derive real per-NIC throughput by diffing.
-    private Dictionary<string, (ulong rx, ulong tx)> _prevIfaceBytes = new();
-
-    // Adaptadores virtuais a ignorar (queremos só Wi-Fi/Ethernet físicas reais).
-    private static readonly string[] VirtualNicFragments =
-    {
-        "virtual", "vmware", "hyper-v", "vethernet", "vpn", "tap",
-        "loopback", "pseudo", "bluetooth", "miniport", "npcap"
-    };
 
     public NetworkSnapshotService(
         ILogger<NetworkSnapshotService> logger,
-        Channel<SecurityEvent> channel,
-        IOptions<MonitorOptions> opts)
+        ChannelWriter<SecurityEvent> writer,
+        IOptions<MonitorOptions> opts,
+        ITcpConnectionSource tcp,
+        INetworkInfo net,
+        TimeProvider time)
     {
         _logger = logger;
-        _writer = channel.Writer;
+        _writer = writer;
         _opts = opts.Value;
-        _inboundPortWhitelist = new HashSet<int>(_opts.InboundPortWhitelist);
-        _sensitivePorts = new HashSet<int>(_opts.SensitiveInboundPorts);
+        _tcp = tcp;
+        _net = net;
+        _time = time;
+        _inboundPortWhitelist = new HashSet<int>(_opts.InboundPortWhitelist ?? new());
+        _sensitivePorts = new HashSet<int>(_opts.SensitiveInboundPorts ?? MonitorOptions.DefaultSensitiveInboundPorts.ToList());
         _selfFragments = _opts.SelfReferenceFragments ?? new List<string>();
     }
+
+    private DateTime UtcNow => _time.GetUtcNow().UtcDateTime;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -75,64 +71,51 @@ public class NetworkSnapshotService : BackgroundService
         }
 
         _logger.LogInformation("NetworkSnapshotService started (snapshot every {Sec}s)", _opts.NetworkSnapshotSeconds);
-
-        try { Directory.CreateDirectory(_opts.AlertsDirectory); PruneOldAlerts(); } catch { }
-
-        // Baseline so we don't fire inbound events for connections that already
-        // existed when the service started.
-        try { _seenInbound = SnapshotInboundKeys(); } catch { /* first cycle will rebuild */ }
+        PruneOldAlertFiles();
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            try
-            {
-                BuildAndWriteSnapshot();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "NetworkSnapshotService cycle failed");
-            }
+            try { RunCycle(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "NetworkSnapshotService cycle failed"); }
 
-            try { await Task.Delay(TimeSpan.FromSeconds(_opts.NetworkSnapshotSeconds), stoppingToken); }
+            try { await Task.Delay(TimeSpan.FromSeconds(_opts.NetworkSnapshotSeconds), _time, stoppingToken); }
             catch (OperationCanceledException) { break; }
         }
     }
 
-    private void BuildAndWriteSnapshot()
+    /// <summary>Um ciclo completo. False quando a tabela TCP não pôde ser lida (estado preservado).</summary>
+    internal bool RunCycle()
     {
-        var listeners = GetListenerPorts();
-        var pidNames = BuildPidNameMap();
-        var rows = IpHlpApi.GetEstablishedConnections();
+        var rows = _tcp.TryGetEstablished();
+        if (rows is null)
+        {
+            _logger.LogDebug("TCP table read failed; keeping previous state");
+            return false;
+        }
 
+        var listeners = Safe(() => _net.GetTcpListeners().Select(ep => ep.Port).ToHashSet(), new HashSet<int>());
+        var pidNames = Safe(() => _net.GetProcessNames(), (IReadOnlyDictionary<int, string>)new Dictionary<int, string>());
+
+        var now = UtcNow;
+        var elapsed = Throughput.ElapsedSeconds(_lastCycleUtc, now);
         var connections = new List<NetworkConnection>(rows.Count);
         var currentInbound = new HashSet<string>();
-
-        // Elapsed since last cycle drives the bytes/s derivation. First cycle (or
-        // after a long pause) leaves _prevBytes empty → every rate is 0.
-        var now = DateTime.UtcNow;
-        double elapsed = (now - _lastCycleUtc).TotalSeconds;
-        if (elapsed <= 0 || elapsed > 60) elapsed = 0;       // ignore stale/garbage intervals
         var nextBytes = new Dictionary<string, ulong>(rows.Count);
 
         foreach (var r in rows)
         {
-            // Direction: if our local port is one we're listening on, the peer
-            // initiated the connection → inbound. Otherwise outbound.
+            // Direção: se a porta local é uma em que escutamos, o par iniciou → entrada.
             bool inbound = listeners.Contains(r.LocalPort);
-            string direction = inbound ? "inbound" : "outbound";
-            bool remotePublic = !IsZero(r.RemoteAddress) && NetworkMonitor.IsPublicAddress(r.RemoteAddress);
+            bool remotePublic = IpClassifier.IsPublic(r.RemoteAddress);
             string procName = pidNames.TryGetValue(r.OwningPid, out var n) ? n : "desconhecido";
 
-            // Throughput: diff this connection's cumulative bytes vs last cycle.
             ulong cum = r.CumBytesIn + r.CumBytesOut;
             var connKey = $"{r.LocalAddress}:{r.LocalPort}|{r.RemoteAddress}:{r.RemotePort}";
             nextBytes[connKey] = cum;
-            long bytesPerSec = 0;
-            if (elapsed > 0 && _prevBytes.TryGetValue(connKey, out var prev) && cum >= prev)
-                bytesPerSec = (long)((cum - prev) / elapsed);
+            long bytesPerSec = _prevBytes.TryGetValue(connKey, out var prev) ? Throughput.Rate(prev, cum, elapsed) : 0;
 
             connections.Add(new NetworkConnection(
-                Direction: direction,
+                Direction: inbound ? "inbound" : "outbound",
                 LocalAddress: r.LocalAddress.ToString(),
                 LocalPort: r.LocalPort,
                 RemoteAddress: r.RemoteAddress.ToString(),
@@ -146,93 +129,59 @@ public class NetworkSnapshotService : BackgroundService
             {
                 var key = $"{r.RemoteAddress}:{r.RemotePort}|{r.LocalPort}";
                 currentInbound.Add(key);
-                MaybeEmitInbound(key, r, procName);
+                if (_seenInbound is not null && !_seenInbound.Contains(key))
+                    EmitInbound(r, procName, now);
             }
         }
 
         var interfaces = BuildInterfaceStats(elapsed);
 
-        _prevBytes = nextBytes;        // drop connections that vanished — no leak
+        _prevBytes = nextBytes;        // descarta conexões que sumiram — sem leak
         _lastCycleUtc = now;
         _seenInbound = currentInbound;
-        WriteSnapshotAtomic(new NetworkSnapshot(now, connections, interfaces));
+        PruneAlertCooldowns(now);
+
+        AtomicFile.WriteAllText(_opts.SnapshotPath,
+            JsonSerializer.Serialize(new NetworkSnapshot(now, connections, interfaces), JsonDefaults.Compact));
+        return true;
     }
 
-    /// <summary>
-    /// Lê os contadores reais de bytes (recebido/enviado) de cada interface física
-    /// ativa e deriva a taxa atual (bytes/s) diferenciando vs. o ciclo anterior —
-    /// mesmo padrão de <see cref="_prevBytes"/>. Diferente do ESTATS por conexão,
-    /// isto reflete TODO o tráfego da NIC (cabeçalhos, UDP, ICMP, etc.).
-    /// </summary>
     private List<NetworkInterfaceStat>? BuildInterfaceStats(double elapsed)
     {
         if (!_opts.InterfaceStatsEnabled) return null;
 
         var stats = new List<NetworkInterfaceStat>();
-        var nextIfaceBytes = new Dictionary<string, (ulong rx, ulong tx)>();
-
-        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+        var next = new Dictionary<string, (ulong Rx, ulong Tx)>();
+        foreach (var ni in Safe(() => _net.GetInterfaceCounters(), (IReadOnlyList<InterfaceCounters>)Array.Empty<InterfaceCounters>()))
         {
-            if (!IsPhysicalUp(ni)) continue;
-
-            ulong cumRx, cumTx;
-            try
-            {
-                var s = ni.GetIPv4Statistics();     // lança se a NIC não tem IPv4
-                cumRx = (ulong)s.BytesReceived;
-                cumTx = (ulong)s.BytesSent;
-            }
-            catch { continue; }
-
-            nextIfaceBytes[ni.Id] = (cumRx, cumTx);
+            if (!NicFilter.IsPhysicalUp(ni)) continue;
+            next[ni.Id] = (ni.BytesReceived, ni.BytesSent);
 
             long down = 0, up = 0;
-            if (elapsed > 0 && _prevIfaceBytes.TryGetValue(ni.Id, out var prev))
+            if (_prevIfaceBytes.TryGetValue(ni.Id, out var prev))
             {
-                if (cumRx >= prev.rx) down = (long)((cumRx - prev.rx) / elapsed);
-                if (cumTx >= prev.tx) up = (long)((cumTx - prev.tx) / elapsed);
+                down = Throughput.Rate(prev.Rx, ni.BytesReceived, elapsed);
+                up = Throughput.Rate(prev.Tx, ni.BytesSent, elapsed);
             }
-
             stats.Add(new NetworkInterfaceStat(ni.Name, down, up));
         }
-
-        _prevIfaceBytes = nextIfaceBytes;     // descarta NICs que sumiram — sem leak
+        _prevIfaceBytes = next;        // descarta NICs que sumiram
         return stats;
     }
 
-    // Só interfaces físicas reais (Wi-Fi/Ethernet) ativas: exclui loopback/túnel
-    // e adaptadores virtuais (VPN, Hyper-V, VMware, Bluetooth, etc.).
-    private static bool IsPhysicalUp(NetworkInterface ni)
-    {
-        if (ni.OperationalStatus != OperationalStatus.Up) return false;
-        if (ni.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
-            return false;
-        if (ni.NetworkInterfaceType is not (NetworkInterfaceType.Ethernet
-            or NetworkInterfaceType.GigabitEthernet
-            or NetworkInterfaceType.Wireless80211))
-            return false;
-
-        var hay = (ni.Description + " " + ni.Name);
-        foreach (var frag in VirtualNicFragments)
-            if (hay.Contains(frag, StringComparison.OrdinalIgnoreCase))
-                return false;
-        return true;
-    }
-
-    private void MaybeEmitInbound(string key, IpHlpApi.TcpConnectionRow r, string procName)
+    private void EmitInbound(TcpConnectionRow r, string procName, DateTime now)
     {
         if (!_opts.EmitInboundEvents) return;
-        if (_seenInbound.Contains(key)) return;               // already handled this connection
         if (_inboundPortWhitelist.Contains(r.LocalPort)) return;
         if (IsSelfReference(procName)) return;
 
         bool sensitive = _sensitivePorts.Contains(r.LocalPort);
 
-        // 1) SecurityEvent → slower incident/Claude pipeline.
-        var evt = new SecurityEvent(
-            TimestampUtc: DateTime.UtcNow,
+        // 1) SecurityEvent → pipeline de incidente (mais lento).
+        _writer.TryWrite(new SecurityEvent(
+            TimestampUtc: now,
             Source: "network",
-            Severity: sensitive ? "high" : "medium",
+            Severity: sensitive ? SeverityLevels.High : SeverityLevels.Medium,
             Title: $"Conexão de entrada de {r.RemoteAddress}:{r.RemotePort}",
             Description: "Um host externo (IP público) abriu uma conexão de ENTRADA para esta máquina. Pode ser acesso legítimo (ex.: serviço exposto) ou tentativa de acesso não autorizado.",
             Details: new Dictionary<string, string>
@@ -244,28 +193,24 @@ public class NetworkSnapshotService : BackgroundService
                 ["processName"] = procName,
                 ["pid"] = r.OwningPid.ToString(),
                 ["sensitivePort"] = sensitive ? "true" : "false"
-            });
-        _writer.TryWrite(evt);
+            }));
 
-        // 2) Immediate alert file → always-on Tray toast (per-IP cooldown).
-        WriteAlertIfDue(r, procName, sensitive);
+        // 2) Arquivo de alerta imediato → toast do Tray (cooldown por IP).
+        WriteAlertIfDue(r, procName, sensitive, now);
     }
 
-    private void WriteAlertIfDue(IpHlpApi.TcpConnectionRow r, string procName, bool sensitive)
+    private void WriteAlertIfDue(TcpConnectionRow r, string procName, bool sensitive, DateTime now)
     {
         var ip = r.RemoteAddress.ToString();
-        lock (_alertLock)
-        {
-            if (_lastAlertPerIp.TryGetValue(ip, out var last) &&
-                DateTime.UtcNow - last < TimeSpan.FromMinutes(_opts.InboundAlertCooldownMinutes))
-                return;
-            _lastAlertPerIp[ip] = DateTime.UtcNow;
-        }
+        if (_lastAlertPerIp.TryGetValue(ip, out var last) &&
+            now - last < TimeSpan.FromMinutes(_opts.InboundAlertCooldownMinutes))
+            return;
+        _lastAlertPerIp[ip] = now;
 
-        var portLabel = PortLabel(r.LocalPort);
+        var portLabel = PortLabels.For(r.LocalPort);
         var alert = new NetworkAlert(
-            TimestampUtc: DateTime.UtcNow,
-            Severity: sensitive ? "critical" : "medium",
+            TimestampUtc: now,
+            Severity: sensitive ? SeverityLevels.Critical : SeverityLevels.Medium,
             RemoteAddress: ip,
             RemotePort: r.RemotePort,
             LocalPort: r.LocalPort,
@@ -278,12 +223,9 @@ public class NetworkSnapshotService : BackgroundService
         try
         {
             Directory.CreateDirectory(_opts.AlertsDirectory);
-            int seq = Interlocked.Increment(ref _alertSeq);
-            var name = $"alert_{DateTime.UtcNow:yyyy-MM-dd_HHmmssfff}_{seq}.json";
-            var path = Path.Combine(_opts.AlertsDirectory, name);
-            // Unique, write-once file → direct write (a tmp+rename would raise a
-            // Renamed event, which the Tray's Created-only watcher would miss).
-            File.WriteAllText(path, JsonSerializer.Serialize(alert, JsonOpts));
+            var path = Path.Combine(_opts.AlertsDirectory, ReportNames.Alert(now, Interlocked.Increment(ref _alertSeq)));
+            // Arquivo único, escrito uma vez → escrita direta (o watcher do Tray é Created).
+            File.WriteAllText(path, JsonSerializer.Serialize(alert, JsonDefaults.Compact));
         }
         catch (Exception ex)
         {
@@ -291,7 +233,84 @@ public class NetworkSnapshotService : BackgroundService
         }
     }
 
-    private static string PortLabel(int port) => port switch
+    private void PruneAlertCooldowns(DateTime now)
+    {
+        var cooldown = TimeSpan.FromMinutes(_opts.InboundAlertCooldownMinutes);
+        foreach (var ip in _lastAlertPerIp.Where(kv => now - kv.Value >= cooldown).Select(kv => kv.Key).ToList())
+            _lastAlertPerIp.Remove(ip);
+    }
+
+    internal int AlertCooldownEntries => _lastAlertPerIp.Count;
+
+    private void PruneOldAlertFiles()
+    {
+        try
+        {
+            if (!Directory.Exists(_opts.AlertsDirectory)) return;
+            var cutoff = UtcNow.AddDays(-7);
+            foreach (var f in new DirectoryInfo(_opts.AlertsDirectory).GetFiles("alert_*.json"))
+                if (f.LastWriteTimeUtc < cutoff) { try { f.Delete(); } catch { } }
+        }
+        catch { /* best effort */ }
+    }
+
+    private bool IsSelfReference(string processName)
+        => !string.IsNullOrEmpty(processName) &&
+           _selfFragments.Any(f => !string.IsNullOrEmpty(f) && processName.Contains(f, StringComparison.OrdinalIgnoreCase));
+
+    private T Safe<T>(Func<T> f, T fallback)
+    {
+        try { return f(); }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Network info read failed");
+            return fallback;
+        }
+    }
+}
+
+/// <summary>Derivação de bytes/s a partir de contadores cumulativos.</summary>
+internal static class Throughput
+{
+    /// <summary>Segundos desde o último ciclo; 0 (= sem taxa) no 1º ciclo ou intervalo absurdo (&gt;60s).</summary>
+    public static double ElapsedSeconds(DateTime lastCycleUtc, DateTime nowUtc)
+    {
+        if (lastCycleUtc == default) return 0;
+        var e = (nowUtc - lastCycleUtc).TotalSeconds;
+        return e <= 0 || e > 60 ? 0 : e;
+    }
+
+    /// <summary>Taxa entre dois contadores; 0 se não há intervalo ou se o contador "voltou" (reset).</summary>
+    public static long Rate(ulong previous, ulong current, double elapsedSeconds)
+        => elapsedSeconds > 0 && current >= previous ? (long)((current - previous) / elapsedSeconds) : 0;
+}
+
+/// <summary>Só NICs físicas (Wi-Fi/Ethernet) ativas — exclui loopback, túnel e adaptadores virtuais.</summary>
+internal static class NicFilter
+{
+    private static readonly string[] VirtualNicFragments =
+    {
+        "virtual", "vmware", "hyper-v", "vethernet", "vpn", "tap",
+        "loopback", "pseudo", "bluetooth", "miniport", "npcap"
+    };
+
+    public static bool IsPhysicalUp(InterfaceCounters ni)
+    {
+        if (ni.Status != OperationalStatus.Up) return false;
+        if (ni.Type is not (NetworkInterfaceType.Ethernet
+            or NetworkInterfaceType.GigabitEthernet
+            or NetworkInterfaceType.Wireless80211))
+            return false;
+
+        var hay = ni.Description + " " + ni.Name;
+        return !VirtualNicFragments.Any(f => hay.Contains(f, StringComparison.OrdinalIgnoreCase));
+    }
+}
+
+/// <summary>Rótulo amigável (pt-BR) da porta local de uma conexão de entrada.</summary>
+internal static class PortLabels
+{
+    public static string For(int port) => port switch
     {
         21   => "FTP (porta 21)",
         22   => "SSH (porta 22)",
@@ -306,75 +325,4 @@ public class NetworkSnapshotService : BackgroundService
         5985 or 5986 => $"WinRM (porta {port})",
         _ => $"porta {port}"
     };
-
-    private void PruneOldAlerts()
-    {
-        try
-        {
-            var cutoff = DateTime.UtcNow.AddDays(-7);
-            foreach (var f in new DirectoryInfo(_opts.AlertsDirectory).GetFiles("alert_*.json"))
-                if (f.LastWriteTimeUtc < cutoff) { try { f.Delete(); } catch { } }
-        }
-        catch { /* best effort */ }
-    }
-
-    private void WriteSnapshotAtomic(NetworkSnapshot snapshot)
-    {
-        var path = _opts.SnapshotPath;
-        var dir = Path.GetDirectoryName(path);
-        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-
-        var tmp = path + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(snapshot, JsonOpts));
-        File.Move(tmp, path, overwrite: true);
-    }
-
-    private static HashSet<int> GetListenerPorts()
-    {
-        var set = new HashSet<int>();
-        try
-        {
-            foreach (var ep in IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
-                set.Add(ep.Port);
-        }
-        catch { /* best effort */ }
-        return set;
-    }
-
-    private static Dictionary<int, string> BuildPidNameMap()
-    {
-        var map = new Dictionary<int, string>();
-        foreach (var p in Process.GetProcesses())
-        {
-            try { map[p.Id] = p.ProcessName; }
-            catch { /* exited / access denied */ }
-            finally { p.Dispose(); }
-        }
-        return map;
-    }
-
-    private HashSet<string> SnapshotInboundKeys()
-    {
-        var listeners = GetListenerPorts();
-        var keys = new HashSet<string>();
-        foreach (var r in IpHlpApi.GetEstablishedConnections())
-        {
-            if (!listeners.Contains(r.LocalPort)) continue;
-            if (IsZero(r.RemoteAddress) || !NetworkMonitor.IsPublicAddress(r.RemoteAddress)) continue;
-            keys.Add($"{r.RemoteAddress}:{r.RemotePort}|{r.LocalPort}");
-        }
-        return keys;
-    }
-
-    private bool IsSelfReference(string text)
-    {
-        if (string.IsNullOrEmpty(text)) return false;
-        foreach (var frag in _selfFragments)
-            if (!string.IsNullOrEmpty(frag) && text.Contains(frag, StringComparison.OrdinalIgnoreCase))
-                return true;
-        return false;
-    }
-
-    private static bool IsZero(IPAddress addr)
-        => addr.Equals(IPAddress.Any) || addr.Equals(IPAddress.IPv6Any);
 }
