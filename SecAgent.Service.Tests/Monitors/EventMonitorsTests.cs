@@ -276,6 +276,18 @@ public sealed class SuspiciousEventProcessorTests : IDisposable
     private readonly TempDir _dir = new();
     public void Dispose() => _dir.Dispose();
 
+    /// <summary>Lê como o Tray (FileShare.ReadWrite) para não bloquear o escritor.</summary>
+    private static string[] ReadLines(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            return sr.ReadToEnd().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
+        }
+        catch (IOException) { return Array.Empty<string>(); }
+    }
+
     private MonitorOptions Opts(bool auto) => new()
     {
         EventsDirectory = Path.Combine(_dir.Path, "events"),
@@ -302,7 +314,7 @@ public sealed class SuspiciousEventProcessorTests : IDisposable
 
         // análise "travada" no Claude: o journal continua recebendo
         for (int i = 2; i < 6; i++) channel.Writer.TryWrite(Test.Event(Test.T0.UtcDateTime, title: $"e{i}"));
-        await Test.Eventually(() => File.Exists(jsonl) && File.ReadAllLines(jsonl).Length == 6);
+        await Test.Eventually(() => ReadLines(jsonl).Length == 6);
 
         gate.SetResult(null!);
         channel.Writer.Complete();
@@ -310,7 +322,7 @@ public sealed class SuspiciousEventProcessorTests : IDisposable
 
         await analyzer.Received(1).AnalyzeIncidentAsync(Arg.Is<IReadOnlyList<SecurityEvent>>(l => l.Count == 2),
             Arg.Any<DateTime>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
-        var first = JsonSerializer.Deserialize<SecurityEvent>(File.ReadAllLines(jsonl)[0], JsonDefaults.Read)!;
+        var first = JsonSerializer.Deserialize<SecurityEvent>(ReadLines(jsonl)[0], JsonDefaults.Read)!;
         Assert.Equal("e0", first.Title);
     }
 

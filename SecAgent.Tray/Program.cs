@@ -1,5 +1,6 @@
 namespace SecAgent.Tray;
 
+[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage(Justification = "Entry point WinForms")]
 static class Program
 {
     [STAThread]

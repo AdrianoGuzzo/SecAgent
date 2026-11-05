@@ -1,64 +1,47 @@
-using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
-using SecAgent.Tray.Models;
+using SecAgent.Tray.Core;
 
 namespace SecAgent.Tray;
 
 /// <summary>
-/// Reads every Service→Tray file and pushes typed messages to the dashboard.
-/// The host does ALL disk I/O; the WebView page only renders. Messages are
-/// raised as (type, payloadJson) via <see cref="Message"/>; the form wraps them
-/// in a {type,payload} envelope and posts to the page.
+/// Lê os arquivos Service → Tray e empurra mensagens tipadas para o painel. O host
+/// faz TODO o I/O; a página só renderiza. Mensagens saem como (type, payloadJson)
+/// pelo evento <see cref="Message"/>; o form embrulha em {type,payload}.
 ///
-/// Active only while the dashboard window is open (Start/Stop), so there is no
-/// overhead when the user isn't looking. The existing tray-icon watchers in
-/// TrayApplicationContext are untouched.
+/// Ativo só com o painel aberto (Start/Stop). Watchers + um poll leve de
+/// fallback (3s) que roda num timer de thread pool — T4: antes era um timer
+/// WinForms, ou seja, as leituras com retry (Thread.Sleep) rodavam na UI thread.
 /// </summary>
 public sealed class DataPump : IDisposable
 {
-    private const string DataDir = @"C:\ProgramData\SecAgent";
-    private const string StatusPath = @"C:\ProgramData\SecAgent\status.json";
-    private const string ProgressPath = @"C:\ProgramData\SecAgent\progress.json";
-    private const string NetworkPath = @"C:\ProgramData\SecAgent\network.json";
-    private const string BlockedPath = @"C:\ProgramData\SecAgent\blocked.json";
-    private const string ReportsDir = @"C:\ProgramData\SecAgent\reports";
-    private const string EventsDir = @"C:\ProgramData\SecAgent\events";
-    private const int PreloadEventLines = 50;
+    internal const int PreloadEventLines = 50;
+    internal static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(3);
 
-    // The Service writes PascalCase JSON; the dashboard page reads camelCase.
-    // JsonOpts deserializes case-insensitively, OutOpts re-serializes to camelCase.
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        PropertyNameCaseInsensitive = true
-    };
-    private static readonly JsonSerializerOptions OutOpts = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
-
-    private readonly GeoLookup _geo;        // shared, owned by TrayApplicationContext
-    private readonly System.Windows.Forms.Timer _timer;
-    private FileSystemWatcher? _progressWatcher;
-    private FileSystemWatcher? _networkWatcher;
-    private FileSystemWatcher? _blockedWatcher;
-    private FileSystemWatcher? _reportWatcher;
-    private FileSystemWatcher? _eventsWatcher;
-
-    private string? _eventsPath;
-    private long _eventsOffset;
+    private readonly AgentPaths _paths;
+    private readonly IGeoLookup _geo;            // compartilhado, dono = TrayApplicationContext
+    private readonly Func<bool> _tokenConfigured;
+    private readonly AiPrefsStore _prefs;
+    private readonly TimeProvider _time;
+    private readonly EventsTail _events;
+    private readonly List<FileSystemWatcher> _watchers = new();
+    private readonly SemaphoreSlim _pollGate = new(1, 1);
+    private ITimer? _timer;
     private bool _started;
-    private readonly object _eventsLock = new();
 
-    /// <summary>(type, payloadJson) — payloadJson is already valid JSON or "null".</summary>
+    /// <summary>(type, payloadJson) — payloadJson já é JSON válido ou "null".</summary>
     public event Action<string, string>? Message;
 
-    public DataPump(GeoLookup geo)
+    public DataPump(IGeoLookup geo)
+        : this(AgentPaths.Default, geo, TokenSetup.IsConfigured, AiPrefsStore.Default, TimeProvider.System) { }
+
+    internal DataPump(AgentPaths paths, IGeoLookup geo, Func<bool> tokenConfigured, AiPrefsStore prefs, TimeProvider time)
     {
+        _paths = paths;
         _geo = geo;
-        _timer = new System.Windows.Forms.Timer { Interval = 3000 };
-        _timer.Tick += (_, _) => PollLight();
+        _tokenConfigured = tokenConfigured;
+        _prefs = prefs;
+        _time = time;
+        _events = new EventsTail(paths, time);
         _geo.Resolved += OnGeoResolved;
     }
 
@@ -67,341 +50,197 @@ public sealed class DataPump : IDisposable
         if (_started) return;
         _started = true;
 
-        try { Directory.CreateDirectory(ReportsDir); } catch { }
-        try { Directory.CreateDirectory(EventsDir); } catch { }
+        try { Directory.CreateDirectory(_paths.ReportsDir); } catch { }
+        try { Directory.CreateDirectory(_paths.EventsDir); } catch { }
 
-        TryWatch(ref _progressWatcher, DataDir, "progress.json", OnProgressChanged, OnProgressDeleted);
-        TryWatch(ref _networkWatcher, DataDir, "network.json", (_, _) => EmitNetwork(), null);
-        TryWatch(ref _blockedWatcher, DataDir, "blocked.json", (_, _) => EmitBlocked(), null);
-        TryWatch(ref _reportWatcher, ReportsDir, "*.json", OnReportChanged, null);
-        TryWatch(ref _eventsWatcher, EventsDir, "events_*.jsonl", (_, _) => ReadNewEvents(), null);
+        Watch(_paths.DataRoot, "progress.json", () => EmitProgressAsync(), () => Emit("progress", "null"));
+        Watch(_paths.DataRoot, "network.json", () => EmitNetworkAsync(), null);
+        Watch(_paths.DataRoot, "blocked.json", () => EmitBlockedAsync(), null);
+        Watch(_paths.ReportsDir, "*.json", null, null, OnReportChangedAsync);
+        Watch(_paths.EventsDir, "events_*.jsonl", () => { ReadNewEvents(); return Task.CompletedTask; }, null);
 
-        _timer.Start();
+        _timer = _time.CreateTimer(_ => { if (_started) _ = PollLightAsync(); }, null, PollInterval, PollInterval);
     }
 
     public void Stop()
     {
         if (!_started) return;
         _started = false;
-        _timer.Stop();
-        DisposeWatcher(ref _progressWatcher);
-        DisposeWatcher(ref _networkWatcher);
-        DisposeWatcher(ref _blockedWatcher);
-        DisposeWatcher(ref _reportWatcher);
-        DisposeWatcher(ref _eventsWatcher);
+        _timer?.Dispose();
+        _timer = null;
+        foreach (var w in _watchers) { try { w.Dispose(); } catch { } }
+        _watchers.Clear();
     }
 
-    /// <summary>Pushes the full current state to a freshly-opened window.</summary>
-    public void RequestInitialSnapshot()
+    /// <summary>Envia o estado completo para uma janela recém-aberta.</summary>
+    public async Task RequestInitialSnapshotAsync()
     {
-        EmitStatus();
-        EmitProgress();
-        EmitLatestReport();
-        EmitLatestIncident();
-        EmitNetwork();
-        EmitBlocked();
+        await EmitStatusAsync();
+        await EmitProgressAsync();
+        await EmitLatestReportAsync();
+        await EmitLatestIncidentAsync();
+        await EmitNetworkAsync();
+        await EmitBlockedAsync();
         EmitTokenStatus();
         EmitAiPrefs();
         PreloadEvents();
     }
 
-    /// <summary>
-    /// Envia a última escolha de modelo/esforço para o painel pré-selecionar os
-    /// dropdowns. Origem é o arquivo de prefs local (não um arquivo do Service),
-    /// por isso é computado aqui no host.
-    /// </summary>
-    public void EmitAiPrefs()
-    {
-        var (model, effort) = AiPrefs.Load();
-        Message?.Invoke("aiPrefs",
-            $"{{\"model\":\"{model}\",\"effort\":\"{effort}\"}}");
-    }
+    /// <summary>Última escolha de modelo/esforço (prefs locais, não arquivo do Service).</summary>
+    public void EmitAiPrefs() => Emit("aiPrefs", _prefs.ToMessageJson());
 
-    /// <summary>
-    /// Emits whether the Claude OAuth token is configured, so the page can show the
-    /// AI button or the "Configurar IA" wrench. Sourced from the env var (not a
-    /// Service file), so it's computed here in the host. Public so the form can
-    /// refresh the page immediately after the token is saved.
-    /// </summary>
+    /// <summary>Token configurado? Público para o form atualizar logo após salvar.</summary>
     public void EmitTokenStatus()
-        => Message?.Invoke("tokenStatus",
-            "{\"configured\":" + (TokenSetup.IsConfigured() ? "true" : "false") + "}");
+        => Emit("tokenStatus", "{\"configured\":" + (_tokenConfigured() ? "true" : "false") + "}");
 
     // ---- emitters -----------------------------------------------------------
 
-    private void EmitStatus()
+    private void Emit(string type, string payload) => Message?.Invoke(type, payload);
+
+    internal async Task EmitStatusAsync()
     {
-        var json = ReadAndCamel<AgentStatus>(StatusPath);
-        if (json is not null) Message?.Invoke("status", json);
+        var json = await JsonFileReader.ReadAsCamelAsync<AgentStatus>(_paths.StatusFile);
+        if (json is not null) Emit("status", json);
     }
 
-    private void EmitProgress()
+    internal async Task EmitProgressAsync()
     {
-        if (!File.Exists(ProgressPath)) { Message?.Invoke("progress", "null"); return; }
-        var json = ReadAndCamel<AnalysisProgress>(ProgressPath);
-        Message?.Invoke("progress", json ?? "null");
+        var json = await JsonFileReader.ReadAsCamelAsync<AnalysisProgress>(_paths.ProgressFile);
+        Emit("progress", json ?? "null");
     }
 
-    private void EmitLatestReport()
+    internal async Task EmitLatestReportAsync()
     {
-        var latest = LatestFile(ReportsDir, "report_*.json");
+        var latest = LatestFile("report_*.json");
         if (latest is null) return;
-        var json = ReadAndCamel<AnalysisResult>(latest);
-        if (json is not null) Message?.Invoke("report", json);
+        var json = await JsonFileReader.ReadAsCamelAsync<AnalysisResult>(latest);
+        if (json is not null) Emit("report", json);
     }
 
-    private void EmitLatestIncident()
+    internal async Task EmitLatestIncidentAsync()
     {
-        var latest = LatestFile(ReportsDir, "incident_*.json");
+        // Ignora os sidecars *.events.json (snapshot forense dos eventos).
+        var latest = LatestFile("incident_*.json", f => !f.Name.EndsWith(".events.json", StringComparison.OrdinalIgnoreCase));
         if (latest is null) return;
-        // Skip the *.events.json sidecar files.
-        if (latest.EndsWith(".events.json", StringComparison.OrdinalIgnoreCase))
-        {
-            latest = new DirectoryInfo(ReportsDir).GetFiles("incident_*.json")
-                .Where(f => !f.Name.EndsWith(".events.json", StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(f => f.LastWriteTimeUtc)
-                .FirstOrDefault()?.FullName;
-            if (latest is null) return;
-        }
-        var json = ReadAndCamel<IncidentReport>(latest);
-        if (json is not null) Message?.Invoke("incident", json);
+        var json = await JsonFileReader.ReadAsCamelAsync<IncidentReport>(latest);
+        if (json is not null) Emit("incident", json);
     }
 
-    private void EmitNetwork()
+    internal async Task EmitNetworkAsync()
     {
-        var raw = ReadJsonRaw(NetworkPath);
-        if (raw is null) return;
-
-        NetworkSnapshot? snap;
-        try { snap = JsonSerializer.Deserialize<NetworkSnapshot>(raw, JsonOpts); }
-        catch { return; }
+        var snap = await JsonFileReader.ReadAsync<NetworkSnapshot>(_paths.NetworkFile);
         if (snap is null) return;
+        Emit("network", JsonSerializer.Serialize(snap, JsonDefaults.CamelCase));
 
-        Message?.Invoke("network", JsonSerializer.Serialize(snap, OutOpts));
-
-        // Kick off / surface geolocation for public remote IPs.
-        if (snap.Connections is null) return;
-        foreach (var ip in snap.Connections
-                     .Where(c => c.RemoteIsPublic)
-                     .Select(c => c.RemoteAddress)
-                     .Distinct())
+        // Geolocalização dos IPs públicos: cache → emite já; senão enfileira.
+        foreach (var ip in (snap.Connections ?? new()).Where(c => c.RemoteIsPublic).Select(c => c.RemoteAddress).Distinct())
         {
-            var cached = _geo.TryGetCached(ip);
-            if (cached is not null) EmitGeo(ip, cached);
+            if (_geo.TryGetCached(ip) is { } cached) EmitGeo(ip, cached);
             else _geo.QueueLookup(ip);
         }
     }
 
-    private void EmitBlocked()
+    internal async Task EmitBlockedAsync()
     {
-        var json = ReadAndCamel<BlockedList>(BlockedPath);
-        if (json is not null) Message?.Invoke("blocked", json);
+        var json = await JsonFileReader.ReadAsCamelAsync<BlockedList>(_paths.BlockedFile);
+        if (json is not null) Emit("blocked", json);
     }
 
-    private void OnGeoResolved(string ip, GeoLookup.GeoInfo info) => EmitGeo(ip, info);
+    private void OnGeoResolved(string ip, GeoInfo info) => EmitGeo(ip, info);
 
-    private void EmitGeo(string ip, GeoLookup.GeoInfo info)
+    private void EmitGeo(string ip, GeoInfo info)
+        => Emit("geo", JsonSerializer.Serialize(new { ip, geo = info }, JsonDefaults.CamelCase));
+
+    // ---- eventos ------------------------------------------------------------
+
+    internal void PreloadEvents() => EmitEvents(_events.Preload(PreloadEventLines));
+
+    internal void ReadNewEvents() => EmitEvents(_events.ReadNew());
+
+    private void EmitEvents(List<string> lines)
     {
-        var payload = JsonSerializer.Serialize(new { ip, geo = info }, OutOpts);
-        Message?.Invoke("geo", payload);
-    }
-
-    // ---- events tailing -----------------------------------------------------
-
-    private void PreloadEvents()
-    {
-        lock (_eventsLock)
-        {
-            var path = TodaysEventsPath();
-            _eventsPath = path;
-            _eventsOffset = 0;
-            if (!File.Exists(path)) return;
-
-            try
-            {
-                var lines = new List<string>();
-                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var sr = new StreamReader(fs, Encoding.UTF8))
-                {
-                    string? line;
-                    while ((line = sr.ReadLine()) != null)
-                        if (line.Length > 0) lines.Add(line);
-                    _eventsOffset = fs.Length;
-                }
-
-                var recent = lines.Count > PreloadEventLines
-                    ? lines.GetRange(lines.Count - PreloadEventLines, PreloadEventLines)
-                    : lines;
-                EmitEventsFromLines(recent);
-            }
-            catch { /* best effort */ }
-        }
-    }
-
-    private void ReadNewEvents()
-    {
-        lock (_eventsLock)
-        {
-            var path = TodaysEventsPath();
-            if (!string.Equals(path, _eventsPath, StringComparison.OrdinalIgnoreCase))
-            {
-                _eventsPath = path;          // UTC day rollover → new file
-                _eventsOffset = 0;
-            }
-            if (!File.Exists(path)) return;
-
-            try
-            {
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                if (fs.Length < _eventsOffset) _eventsOffset = 0;     // file truncated/rotated
-                if (fs.Length == _eventsOffset) return;
-
-                fs.Seek(_eventsOffset, SeekOrigin.Begin);
-                var buffer = new byte[fs.Length - _eventsOffset];
-                int read = fs.Read(buffer, 0, buffer.Length);
-
-                // Only consume up to the last complete line (last '\n').
-                int lastNl = Array.LastIndexOf(buffer, (byte)'\n', read - 1);
-                if (lastNl < 0) return;                               // no complete line yet
-
-                var text = Encoding.UTF8.GetString(buffer, 0, lastNl + 1);
-                _eventsOffset += Encoding.UTF8.GetByteCount(text);
-
-                var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries)
-                                .Select(l => l.Trim())
-                                .Where(l => l.Length > 0)
-                                .ToList();
-                EmitEventsFromLines(lines);
-            }
-            catch { /* mid-write — retry next tick */ }
-        }
-    }
-
-    private void EmitEventsFromLines(List<string> lines)
-    {
-        if (lines.Count == 0) return;
         var events = new List<SecurityEvent>();
         foreach (var l in lines)
         {
             try
             {
-                var e = JsonSerializer.Deserialize<SecurityEvent>(l, JsonOpts);
-                if (e is not null) events.Add(e);
+                if (JsonSerializer.Deserialize<SecurityEvent>(l, JsonDefaults.Read) is { } e) events.Add(e);
             }
-            catch { /* skip malformed line */ }
+            catch (JsonException) { /* linha malformada */ }
         }
-        if (events.Count == 0) return;
-        Message?.Invoke("events", JsonSerializer.Serialize(events, OutOpts));
+        if (events.Count > 0) Emit("events", JsonSerializer.Serialize(events, JsonDefaults.CamelCase));
     }
 
-    private static string TodaysEventsPath()
-        => Path.Combine(EventsDir, $"events_{DateTime.UtcNow:yyyy-MM-dd}.jsonl");
+    // ---- watchers / poll ----------------------------------------------------
 
-    // ---- watcher handlers ---------------------------------------------------
-
-    private void OnProgressChanged(object? s, FileSystemEventArgs e) => EmitProgress();
-    private void OnProgressDeleted(object? s, FileSystemEventArgs e) => Message?.Invoke("progress", "null");
-
-    private void OnReportChanged(object? s, FileSystemEventArgs e)
+    internal Task OnReportChangedAsync(string? name)
     {
-        var name = e.Name ?? "";
-        if (name.StartsWith("incident_", StringComparison.OrdinalIgnoreCase))
-            EmitLatestIncident();
-        else if (name.StartsWith("report_", StringComparison.OrdinalIgnoreCase))
-            EmitLatestReport();
+        name ??= "";
+        if (name.StartsWith("incident_", StringComparison.OrdinalIgnoreCase)) return EmitLatestIncidentAsync();
+        if (name.StartsWith("report_", StringComparison.OrdinalIgnoreCase)) return EmitLatestReportAsync();
+        return Task.CompletedTask;
     }
 
-    private void PollLight()
+    /// <summary>Fallback para eventos de watcher perdidos (barato; idempotente na página).</summary>
+    internal async Task PollLightAsync()
     {
-        // Fallback for missed watcher events (cheap, idempotent on the page side).
-        EmitStatus();
-        EmitProgress();
-        EmitNetwork();
-        EmitBlocked();
-        EmitTokenStatus();
-        ReadNewEvents();
+        if (!await _pollGate.WaitAsync(0)) return;   // poll anterior ainda rodando
+        try
+        {
+            await EmitStatusAsync();
+            await EmitProgressAsync();
+            await EmitNetworkAsync();
+            await EmitBlockedAsync();
+            EmitTokenStatus();
+            ReadNewEvents();
+        }
+        catch (Exception) { /* nunca derruba o timer */ }
+        finally { _pollGate.Release(); }
     }
 
-    // ---- helpers ------------------------------------------------------------
-
-    private static void TryWatch(
-        ref FileSystemWatcher? watcher, string dir, string filter,
-        FileSystemEventHandler onChanged, FileSystemEventHandler? onDeleted)
+    private void Watch(string dir, string filter, Func<Task>? onChanged, Action? onDeleted,
+        Func<string?, Task>? onChangedNamed = null)
     {
         try
         {
             var w = new FileSystemWatcher(dir, filter)
             {
-                EnableRaisingEvents = true,
                 NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size
             };
-            w.Created += onChanged;
-            w.Changed += onChanged;
+            void Fire(string? name)
+            {
+                if (!_started) return;   // evento atrasado após Stop
+                var t = onChangedNamed is not null ? onChangedNamed(name) : onChanged?.Invoke();
+                t?.ContinueWith(_ => { }, TaskContinuationOptions.OnlyOnFaulted);
+            }
+            w.Created += (_, e) => Fire(e.Name);
+            w.Changed += (_, e) => Fire(e.Name);
             // O Service grava por escrita atômica (File.Move com overwrite), que no
-            // Windows chega como Renamed — não Created/Changed. Sem assinar isto, todo
-            // update após o primeiro era perdido e o painel só atualizava pelo PollLight
-            // (3s). RenamedEventArgs deriva de FileSystemEventArgs, então repassa direto.
-            w.Renamed += (s, e) => onChanged(s, e);
-            if (onDeleted is not null) w.Deleted += onDeleted;
-            watcher = w;
+            // Windows chega como Renamed — não Created/Changed.
+            w.Renamed += (_, e) => Fire(e.Name);
+            if (onDeleted is not null) w.Deleted += (_, _) => { if (_started) onDeleted(); };
+            w.EnableRaisingEvents = true;
+            _watchers.Add(w);
         }
-        catch { /* dir may not exist yet — fallback timer still polls */ }
+        catch (Exception) { /* pasta pode não existir ainda — o poll cobre */ }
     }
 
-    private static void DisposeWatcher(ref FileSystemWatcher? w)
-    {
-        try { w?.Dispose(); } catch { }
-        w = null;
-    }
-
-    private static string? LatestFile(string dir, string pattern)
+    private string? LatestFile(string pattern, Func<FileInfo, bool>? filter = null)
     {
         try
         {
-            return new DirectoryInfo(dir).GetFiles(pattern)
+            return new DirectoryInfo(_paths.ReportsDir).GetFiles(pattern)
+                .Where(filter ?? (_ => true))
                 .OrderByDescending(f => f.LastWriteTimeUtc)
                 .FirstOrDefault()?.FullName;
         }
-        catch { return null; }
-    }
-
-    /// <summary>Reads a PascalCase JSON file and re-serializes it as camelCase for the page.</summary>
-    private static string? ReadAndCamel<T>(string path)
-    {
-        var raw = ReadJsonRaw(path);
-        if (raw is null) return null;
-        try
-        {
-            var obj = JsonSerializer.Deserialize<T>(raw, JsonOpts);
-            return obj is null ? null : JsonSerializer.Serialize(obj, OutOpts);
-        }
-        catch { return null; }
-    }
-
-    /// <summary>Reads a JSON file with brief retry; returns null if missing/unparseable.</summary>
-    private static string? ReadJsonRaw(string path)
-    {
-        for (int attempt = 0; attempt < 3; attempt++)
-        {
-            try
-            {
-                if (!File.Exists(path)) return null;
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var sr = new StreamReader(fs, Encoding.UTF8);
-                var json = sr.ReadToEnd();
-                if (string.IsNullOrWhiteSpace(json)) { Thread.Sleep(80); continue; }
-                using var _ = JsonDocument.Parse(json);     // validate (mid-write guard)
-                return json;
-            }
-            catch { Thread.Sleep(80); }
-        }
-        return null;
+        catch (IOException) { return null; }
     }
 
     public void Dispose()
     {
         Stop();
-        _geo.Resolved -= OnGeoResolved;     // shared instance — do NOT dispose it here
-        _timer.Dispose();
+        _geo.Resolved -= OnGeoResolved;   // instância compartilhada — NÃO descartar aqui
+        _pollGate.Dispose();
     }
 }

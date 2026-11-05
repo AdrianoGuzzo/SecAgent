@@ -1,69 +1,72 @@
 namespace SecAgent.Tray;
 
 /// <summary>
-/// Helpers for the Claude OAuth token (CLAUDE_CODE_OAUTH_TOKEN) used by the
-/// Service to invoke the Claude CLI. The Tray runs as the logged-in user and can
-/// READ the Machine-scope env var without admin; WRITING it (and restarting the
-/// service) needs elevation — see <see cref="TokenSetupForm"/>.
+/// Token OAuth do Claude (CLAUDE_CODE_OAUTH_TOKEN) usado pelo Service. O Tray roda
+/// como o usuário logado e consegue LER a env var de máquina sem admin; GRAVAR
+/// (e reiniciar o serviço) exige elevação — ver <see cref="TokenSetupForm"/>.
+///
+/// As fontes (env var / existência de arquivo) são injetáveis para teste; as
+/// sobrecargas sem parâmetros usam o ambiente real.
 /// </summary>
 public static class TokenSetup
 {
     public const string TokenVar = "CLAUDE_CODE_OAUTH_TOKEN";
     public const string TokenPrefix = "sk-ant-oat";
 
-    /// <summary>
-    /// True when a token that looks valid (non-empty + expected prefix) is present
-    /// in Machine scope (preferred) or User scope. This only checks presence/shape;
-    /// real validity (expiry) is only known when the Service runs an analysis.
-    /// </summary>
-    public static bool IsConfigured()
-    {
-        var token = ReadToken();
-        return !string.IsNullOrWhiteSpace(token) &&
-               token.StartsWith(TokenPrefix, StringComparison.Ordinal);
-    }
+    /// <summary>Lê uma env var num escopo (null em erro).</summary>
+    public delegate string? EnvironmentReader(string name, EnvironmentVariableTarget target);
 
-    /// <summary>Reads the token from Machine scope, falling back to User scope.</summary>
-    public static string? ReadToken()
+    internal static readonly EnvironmentReader RealEnvironment = (name, target) =>
     {
-        var machine = SafeGet(EnvironmentVariableTarget.Machine);
-        if (!string.IsNullOrWhiteSpace(machine)) return machine;
-        return SafeGet(EnvironmentVariableTarget.User);
-    }
-
-    private static string? SafeGet(EnvironmentVariableTarget target)
-    {
-        try { return Environment.GetEnvironmentVariable(TokenVar, target); }
+        try { return Environment.GetEnvironmentVariable(name, target); }
         catch { return null; }
-    }
+    };
+
+    public static bool IsConfigured() => IsConfigured(RealEnvironment);
 
     /// <summary>
-    /// Locates claude.exe the same way the installer does: the standard Claude Code
-    /// Windows install path, then a PATH search. Returns null if not found.
+    /// True quando há um token com cara de válido (não vazio + prefixo esperado)
+    /// no escopo Machine (preferido) ou User. Só checa forma; validade real só é
+    /// conhecida quando o Service roda uma análise.
     /// </summary>
-    public static string? DetectClaudeExe()
+    public static bool IsConfigured(EnvironmentReader env)
     {
-        try
-        {
-            var profile = Environment.GetEnvironmentVariable("USERPROFILE");
-            if (!string.IsNullOrEmpty(profile))
-            {
-                var candidate = Path.Combine(profile, ".local", "bin", "claude.exe");
-                if (File.Exists(candidate)) return candidate;
-            }
+        var token = ReadToken(env);
+        return !string.IsNullOrWhiteSpace(token) && token.StartsWith(TokenPrefix, StringComparison.Ordinal);
+    }
 
-            var path = Environment.GetEnvironmentVariable("PATH") ?? "";
-            foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
-            {
-                try
-                {
-                    var candidate = Path.Combine(dir.Trim(), "claude.exe");
-                    if (File.Exists(candidate)) return candidate;
-                }
-                catch { /* malformed PATH entry — skip */ }
-            }
+    public static string? ReadToken(EnvironmentReader env)
+    {
+        var machine = env(TokenVar, EnvironmentVariableTarget.Machine);
+        if (!string.IsNullOrWhiteSpace(machine)) return machine;
+        return env(TokenVar, EnvironmentVariableTarget.User);
+    }
+
+    public static string? DetectClaudeExe()
+        => DetectClaudeExe(name => RealEnvironment(name, EnvironmentVariableTarget.Process), File.Exists);
+
+    /// <summary>
+    /// Localiza o claude.exe como o instalador: caminho padrão do Claude Code
+    /// (%USERPROFILE%\.local\bin) e depois o PATH. Null se não achar.
+    /// </summary>
+    public static string? DetectClaudeExe(Func<string, string?> getEnv, Func<string, bool> fileExists)
+    {
+        var profile = getEnv("USERPROFILE");
+        if (!string.IsNullOrEmpty(profile))
+        {
+            var candidate = Path.Combine(profile, ".local", "bin", "claude.exe");
+            if (fileExists(candidate)) return candidate;
         }
-        catch { /* best effort */ }
+
+        foreach (var dir in (getEnv("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                var candidate = Path.Combine(dir.Trim().Trim('"'), "claude.exe");
+                if (fileExists(candidate)) return candidate;
+            }
+            catch (ArgumentException) { /* entrada malformada no PATH */ }
+        }
         return null;
     }
 }

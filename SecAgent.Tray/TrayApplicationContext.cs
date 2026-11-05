@@ -1,58 +1,43 @@
 using System.Diagnostics;
-using System.Text;
-using System.Text.Json;
-using SecAgent.Tray.Models;
+using System.Diagnostics.CodeAnalysis;
+using SecAgent.Tray.Core;
 
 namespace SecAgent.Tray;
 
+/// <summary>
+/// Dono do ciclo de vida do Tray: NotifyIcon, menu, timers e watchers. É só glue —
+/// as regras (ícone, tooltips, toasts, triggers, comandos do painel) estão em
+/// <see cref="TrayStatePresenter"/>, <see cref="TriggerRequester"/> e
+/// <see cref="DashboardCommandParser"/>, que são testadas.
+/// </summary>
+[ExcludeFromCodeCoverage(Justification = "Glue de WinForms (NotifyIcon/menu/watchers); lógica em Core")]
 public class TrayApplicationContext : ApplicationContext
 {
-    private const string DataDir = @"C:\ProgramData\SecAgent";
-    private const string StatusPath = @"C:\ProgramData\SecAgent\status.json";
-    private const string ProgressPath = @"C:\ProgramData\SecAgent\progress.json";
-    private const string ReportsDir = @"C:\ProgramData\SecAgent\reports";
-    private const string EventsDir = @"C:\ProgramData\SecAgent\events";
-    private const string ScansDir = @"C:\ProgramData\SecAgent\scans";
-    private const string TriggersDir = @"C:\ProgramData\SecAgent\triggers";
-    private const string AlertsDir = @"C:\ProgramData\SecAgent\alerts";
-
-    private const string ScanOnlyTrigger = "scan-only.trigger";
-    private const string ScanAndAnalyzeTrigger = "scan-and-analyze.trigger";
-    private const int TriggerDebounceSeconds = 30;
-
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        PropertyNameCaseInsensitive = true
-    };
+    private readonly AgentPaths _paths = AgentPaths.Default;
+    private readonly TriggerRequester _triggers;
+    private readonly AiPrefsStore _prefs = AiPrefsStore.Default;
 
     private readonly NotifyIcon _icon;
     private readonly System.Windows.Forms.Timer _statusTimer;
     private readonly System.Windows.Forms.Timer _progressTimer;
-    private readonly FileSystemWatcher? _reportWatcher;
-    private readonly FileSystemWatcher? _scanWatcher;
-    private readonly FileSystemWatcher? _progressWatcher;
-    private readonly FileSystemWatcher? _alertWatcher;
-    private readonly Dictionary<string, DateTime> _lastTriggerClickUtc = new();
+    private readonly List<FileSystemWatcher> _watchers = new();
 
-    // Shared, always-on geolocation client (used by alerts + the dashboard pump).
+    // Geolocalização compartilhada e sempre ativa (alertas + painel).
     private readonly GeoLookup _geo = new();
 
     private AgentStatus? _status;
     private AnalysisProgress? _currentProgress;
-    private string? _previousProgressState;
-    // The icon to show when no work is in progress (driven by status.json severity).
-    private Icon _severityIcon = SystemIcons.Information;
+    // Ícone "ocioso" (severidade do status.json) quando não há trabalho em andamento.
+    private TrayIconKind _severityIcon = TrayIconKind.Busy;
 
     private DataPump? _dataPump;
     private DashboardForm? _dashboard;
 
     public TrayApplicationContext()
     {
-        Directory.CreateDirectory(DataDir);
-        Directory.CreateDirectory(ReportsDir);
-        Directory.CreateDirectory(EventsDir);
-        Directory.CreateDirectory(ScansDir);
-        Directory.CreateDirectory(AlertsDir);
+        _triggers = new TriggerRequester(_paths, TimeProvider.System);
+        foreach (var dir in new[] { _paths.DataRoot, _paths.ReportsDir, _paths.EventsDir, _paths.ScansDir, _paths.AlertsDir })
+            try { Directory.CreateDirectory(dir); } catch { /* o Service cria; usuário pode não ter permissão */ }
 
         _icon = new NotifyIcon
         {
@@ -65,65 +50,72 @@ public class TrayApplicationContext : ApplicationContext
         _icon.MouseDoubleClick += (_, _) => ShowDashboard();
 
         _statusTimer = new System.Windows.Forms.Timer { Interval = 10_000 };
-        _statusTimer.Tick += (_, _) => RefreshStatus();
+        _statusTimer.Tick += (_, _) => _ = RefreshStatusAsync();
         _statusTimer.Start();
-        RefreshStatus();
+        _ = RefreshStatusAsync();
 
         _progressTimer = new System.Windows.Forms.Timer { Interval = 2_000 };
         _progressTimer.Tick += (_, _) => UpdateProgressTooltip();
 
-        try
-        {
-            _reportWatcher = new FileSystemWatcher(ReportsDir, "*.md")
-            {
-                EnableRaisingEvents = true,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite
-            };
-            _reportWatcher.Created += OnNewReport;
-        }
-        catch { }
+        Watch(_paths.ReportsDir, "*.md", created: OnNewReport);
+        Watch(_paths.ScansDir, "scan_*.json", created: OnNewScan);
+        // progress.json é gravado por escrita atômica (File.Move) → chega como Renamed.
+        Watch(_paths.DataRoot, "progress.json", created: e => { _ = OnProgressChangedAsync(); },
+            changed: true, deleted: _ => OnUi(OnProgressDeleted));
+        // Sempre ativo: toast imediato de alerta de entrada, mesmo com o painel fechado.
+        Watch(_paths.AlertsDir, "alert_*.json", created: e => _ = OnNewAlertAsync(e.FullPath));
 
-        try
-        {
-            _scanWatcher = new FileSystemWatcher(ScansDir, "scan_*.json")
-            {
-                EnableRaisingEvents = true,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite
-            };
-            _scanWatcher.Created += OnNewScan;
-        }
-        catch { }
+        // Se o Service já estava no meio de um scan quando o Tray subiu.
+        _ = OnProgressChangedAsync();
+    }
 
+    // ---- UI helpers ---------------------------------------------------------
+
+    private void OnUi(Action action)
+    {
+        var host = _icon.ContextMenuStrip;
+        if (host is { InvokeRequired: true }) host.BeginInvoke(action);
+        else action();
+    }
+
+    private static Icon ToIcon(TrayIconKind kind) => kind switch
+    {
+        TrayIconKind.Error => SystemIcons.Error,
+        TrayIconKind.Warning => SystemIcons.Warning,
+        TrayIconKind.Shield => SystemIcons.Shield,
+        _ => SystemIcons.Information
+    };
+
+    private void ShowToast(TrayToast? t, int ms = 5000)
+    {
+        if (t is null) return;
+        OnUi(() => _icon.ShowBalloonTip(ms, t.Title, t.Text,
+            t.IsError ? ToolTipIcon.Error : t.IsWarning ? ToolTipIcon.Warning : ToolTipIcon.Info));
+    }
+
+    private void Info(string text, bool error = false)
+        => ShowToast(new TrayToast(TrayStatePresenter.AppName, text, IsError: error), 4000);
+
+    private void Watch(string dir, string filter, Action<FileSystemEventArgs> created,
+        bool changed = false, Action<FileSystemEventArgs>? deleted = null)
+    {
         try
         {
-            _progressWatcher = new FileSystemWatcher(DataDir, "progress.json")
+            var w = new FileSystemWatcher(dir, filter)
             {
-                EnableRaisingEvents = true,
                 NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size
             };
-            _progressWatcher.Created += OnProgressFileEvent;
-            _progressWatcher.Changed += OnProgressFileEvent;
-            _progressWatcher.Deleted += OnProgressFileDeleted;
+            w.Created += (_, e) => created(e);
+            w.Renamed += (_, e) => created(e);
+            if (changed) w.Changed += (_, e) => created(e);
+            if (deleted is not null) w.Deleted += (_, e) => deleted(e);
+            w.EnableRaisingEvents = true;
+            _watchers.Add(w);
         }
-        catch { }
-
-        // Always-on: toast immediately when the Service writes an inbound alert,
-        // even with the dashboard closed.
-        try
-        {
-            _alertWatcher = new FileSystemWatcher(AlertsDir, "alert_*.json")
-            {
-                EnableRaisingEvents = true,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite
-            };
-            _alertWatcher.Created += OnNewAlert;
-        }
-        catch { }
-
-        // If a progress file is already on disk when the tray starts (service
-        // was mid-scan when tray launched), pick it up.
-        OnProgressFileEvent(this, null!);
+        catch { /* pasta pode não existir — o timer de status cobre */ }
     }
+
+    // ---- menu ---------------------------------------------------------------
 
     private ContextMenuStrip BuildMenu()
     {
@@ -131,26 +123,26 @@ public class TrayApplicationContext : ApplicationContext
         menu.Items.Add("Abrir painel", null, (_, _) => ShowDashboard());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Forçar scan agora (sem Claude — grátis)", null,
-            (_, _) => RequestTrigger(ScanOnlyTrigger, "Scan iniciado, aguarde ~5s..."));
+            (_, _) => RequestTrigger(TriggerNames.ScanOnly, "Scan iniciado, aguarde ~5s..."));
         menu.Items.Add("Forçar scan + análise Claude (último modelo escolhido)", null,
-            (_, _) => RequestAnalyze(AiPrefs.Load()));
+            (_, _) => RequestAnalyze(_prefs.Load()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Abrir último relatório de scan", null, (_, _) => OpenLast("report_*.md"));
         menu.Items.Add("Abrir último relatório de incidente", null, (_, _) => OpenLast("incident_*.md"));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Pasta de relatórios", null, (_, _) => OpenFolder(ReportsDir));
-        menu.Items.Add("Pasta de eventos", null, (_, _) => OpenFolder(EventsDir));
+        menu.Items.Add("Pasta de relatórios", null, (_, _) => OpenFolder(_paths.ReportsDir));
+        menu.Items.Add("Pasta de eventos", null, (_, _) => OpenFolder(_paths.EventsDir));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Atualizar status", null, (_, _) => RefreshStatus());
+        menu.Items.Add("Atualizar status", null, (_, _) => _ = RefreshStatusAsync());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Remover SecAgent deste usuário", null, (_, _) => RemoveForCurrentUser());
         menu.Items.Add("Sair", null, (_, _) => ExitThread());
         return menu;
     }
-        
-    // Remoção por usuário (sem admin): tira o Tray e o início automático apenas
-    // da conta atual. O serviço de monitoramento (machine-wide) continua. A
-    // desinstalação completa é feita em "Aplicativos e recursos" (admin).
+
+    // Remoção por usuário (sem admin): tira o Tray e o início automático só da
+    // conta atual. O serviço (machine-wide) continua. Desinstalação completa é
+    // em "Aplicativos e recursos" (admin).
     private void RemoveForCurrentUser()
     {
         var answer = MessageBox.Show(
@@ -160,53 +152,50 @@ public class TrayApplicationContext : ApplicationContext
             "Remover o SecAgent da sua conta agora?",
             "Remover SecAgent deste usuário",
             MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-        if (answer != DialogResult.Yes)
-            return;
+        if (answer != DialogResult.Yes) return;
 
         UserInstall.DisableForCurrentUser();
         ExitThread();
     }
 
-    // Dispara o scan + análise com a escolha de modelo/esforço embutida no
-    // conteúdo do trigger ({"model":"sonnet","effort":"high"}) — o Service lê e
-    // valida. Para Haiku o esforço é ignorado lá (não suporta --effort).
+    // ---- triggers / comandos ------------------------------------------------
+
     private void RequestAnalyze((string Model, string Effort) choice)
-    {
-        var content = JsonSerializer.Serialize(new { model = choice.Model, effort = choice.Effort });
-        RequestTrigger(ScanAndAnalyzeTrigger,
-            $"Varredura + análise ({choice.Model}) iniciadas, aguarde ~1-2 min...", content);
-    }
+        => RequestTrigger(TriggerNames.ScanAndAnalyze,
+            $"Varredura + análise ({choice.Model}) iniciadas, aguarde ~1-2 min...",
+            TriggerRequester.AnalyzeContent(choice.Model, choice.Effort));
 
     private void RequestTrigger(string fileName, string okMessage, string? content = null)
     {
-        if (_lastTriggerClickUtc.TryGetValue(fileName, out var last) &&
-            DateTime.UtcNow - last < TimeSpan.FromSeconds(TriggerDebounceSeconds))
-        {
-            var wait = TriggerDebounceSeconds - (int)(DateTime.UtcNow - last).TotalSeconds;
-            _icon.ShowBalloonTip(3000, "SecAgent",
-                $"Aguarde {wait}s entre solicitações.", ToolTipIcon.Info);
-            return;
-        }
+        var r = _triggers.Request(fileName, content);
+        Info(_triggers.Describe(r, okMessage), error: r.Status is TriggerRequestStatus.Denied or TriggerRequestStatus.Failed);
+    }
 
-        try
+    private void OnDashboardCommand(string raw)
+    {
+        var cmd = DashboardCommandParser.Parse(raw);
+        switch (cmd.Kind)
         {
-            Directory.CreateDirectory(TriggersDir);
-            var path = Path.Combine(TriggersDir, fileName);
-            File.WriteAllText(path, content ?? DateTime.UtcNow.ToString("o"));
-            _lastTriggerClickUtc[fileName] = DateTime.UtcNow;
-            _icon.ShowBalloonTip(4000, "SecAgent", okMessage, ToolTipIcon.Info);
-        }
-        catch (UnauthorizedAccessException)
-        {
-            _icon.ShowBalloonTip(5000, "SecAgent",
-                "Sem permissão para escrever em " + TriggersDir +
-                ". O serviço talvez não esteja rodando — reinstale com deploy.ps1.",
-                ToolTipIcon.Error);
-        }
-        catch (Exception ex)
-        {
-            _icon.ShowBalloonTip(5000, "SecAgent",
-                "Falha ao solicitar trigger: " + ex.Message, ToolTipIcon.Error);
+            case DashboardCommandKind.ScanOnly:
+                RequestTrigger(TriggerNames.ScanOnly, "Varredura iniciada, aguarde ~5s...");
+                break;
+            case DashboardCommandKind.ConfigureToken:
+                OpenTokenSetup();
+                break;
+            case DashboardCommandKind.ScanAndAnalyze when cmd.Model is null:
+                RequestAnalyze(_prefs.Load());
+                break;
+            case DashboardCommandKind.ScanAndAnalyze:
+                _prefs.Save(cmd.Model, cmd.Effort);   // lembra para a próxima vez (painel + menu)
+                RequestAnalyze((cmd.Model!, cmd.Effort!));
+                break;
+            case DashboardCommandKind.BlockIp:
+                // O nome do arquivo leva o IP sanitizado; o IP cru vai no conteúdo.
+                RequestTrigger(TriggerNames.BlockIp(cmd.Ip!), $"Bloqueando {cmd.Ip} (entrada e saída)…", cmd.Ip);
+                break;
+            case DashboardCommandKind.UnblockIp:
+                RequestTrigger(TriggerNames.UnblockIp(cmd.Ip!), $"Desbloqueando {cmd.Ip}…", cmd.Ip);
+                break;
         }
     }
 
@@ -235,315 +224,113 @@ public class TrayApplicationContext : ApplicationContext
         _dashboard.Activate();
     }
 
-    private void OnDashboardCommand(string cmd)
-    {
-        switch (cmd)
-        {
-            case "scanOnly":
-                RequestTrigger(ScanOnlyTrigger, "Varredura iniciada, aguarde ~5s...");
-                return;
-            case "configureToken":
-                OpenTokenSetup();
-                return;
-        }
-
-        // "scanAndAnalyze" (sem dados → última escolha salva) ou
-        // "scanAndAnalyze:<model>:<effort>" (escolha feita nos dropdowns do painel).
-        if (cmd == "scanAndAnalyze")
-        {
-            RequestAnalyze(AiPrefs.Load());
-            return;
-        }
-        if (cmd.StartsWith("scanAndAnalyze:", StringComparison.Ordinal))
-        {
-            var parts = cmd.Split(':');
-            var model = AiPrefs.NormalizeModel(parts.Length > 1 ? parts[1] : null);
-            var effort = AiPrefs.NormalizeEffort(parts.Length > 2 ? parts[2] : null);
-            AiPrefs.Save(model, effort);                 // lembra para a próxima vez (painel + menu)
-            RequestAnalyze((model, effort));
-            return;
-        }
-
-        if (cmd.StartsWith("blockIp:", StringComparison.Ordinal))
-        {
-            var ip = cmd.Substring("blockIp:".Length).Trim();
-            RequestTrigger($"block-ip-{SanitizeIp(ip)}.trigger",
-                $"Bloqueando {ip} (entrada e saída)…", ip);
-        }
-        else if (cmd.StartsWith("unblockIp:", StringComparison.Ordinal))
-        {
-            var ip = cmd.Substring("unblockIp:".Length).Trim();
-            RequestTrigger($"unblock-ip-{SanitizeIp(ip)}.trigger",
-                $"Desbloqueando {ip}…", ip);
-        }
-    }
-
-    // Opens the native token-setup window over the dashboard. After a successful
-    // save, refresh the page so the AI button replaces the "Configurar IA" wrench
-    // without reopening the panel.
+    // Janela nativa de token sobre o painel; após salvar, atualiza a página para
+    // o botão de IA substituir o "Configurar IA".
     private void OpenTokenSetup()
     {
         using var form = new TokenSetupForm();
-        var result = _dashboard is { IsDisposed: false }
-            ? form.ShowDialog(_dashboard)
-            : form.ShowDialog();
-        if (result == DialogResult.OK)
-            _dataPump?.EmitTokenStatus();
+        var result = _dashboard is { IsDisposed: false } ? form.ShowDialog(_dashboard) : form.ShowDialog();
+        if (result == DialogResult.OK) _dataPump?.EmitTokenStatus();
     }
 
-    // IPv6 addresses carry ':' / '%', which are illegal in Windows filenames.
-    // The sanitized form is only for the trigger NAME; the raw IP rides in the
-    // file content (the Service parses/validates that).
-    private static string SanitizeIp(string ip)
-        => ip.Replace(':', '-').Replace('%', '-').Replace('/', '-');
+    // ---- status / progresso -------------------------------------------------
 
-    private void RefreshStatus()
+    private async Task RefreshStatusAsync()
     {
-        if (!File.Exists(StatusPath))
+        var status = await JsonFileReader.ReadAsync<AgentStatus>(_paths.StatusFile);
+        OnUi(() =>
         {
-            _severityIcon = SystemIcons.Information;
-            if (_currentProgress is null)
-            {
-                _icon.Icon = _severityIcon;
-                _icon.Text = "SecAgent (sem status ainda)";
-            }
-            return;
-        }
-
-        try
-        {
-            var json = File.ReadAllText(StatusPath);
-            _status = JsonSerializer.Deserialize<AgentStatus>(json, JsonOpts);
-            if (_status is null) return;
-
-            var sev = (_status.OverallSeverity ?? "green").ToLowerInvariant();
-            _severityIcon = sev switch
-            {
-                "red" => SystemIcons.Error,
-                "yellow" => SystemIcons.Warning,
-                _ => SystemIcons.Shield
-            };
-
-            // Only swap to the severity icon when no progress is active.
-            // Otherwise leave the busy icon in place; OnProgressFileDeleted
-            // will restore _severityIcon when work completes.
-            if (_currentProgress is null)
-            {
-                _icon.Icon = _severityIcon;
-                _icon.Text = BuildStatusTooltip(_status);
-            }
-        }
-        catch
-        {
-            // Status file may be mid-write; try again on next tick.
-        }
+            _status = status;
+            _severityIcon = TrayStatePresenter.SeverityIcon(status);
+            // Só troca o ícone sem progresso ativo; senão mantém o "ocupado".
+            if (_currentProgress is null) ShowIdle();
+        });
     }
 
-    private static string BuildStatusTooltip(AgentStatus s)
+    private void ShowIdle()
     {
-        var sb = new StringBuilder("SecAgent");
-        if (s.LastScan is { } scan)
-            sb.Append($"\nScan: {scan.RiskLevel} ({scan.FindingsCount} findings, {scan.TimestampUtc.ToLocalTime():HH:mm})");
-        if (s.LastIncident is { } inc)
-            sb.Append($"\nIncidente: {inc.Severity} ({inc.TimestampUtc.ToLocalTime():HH:mm})");
-        var t = sb.ToString();
-        return t.Length > 127 ? t[..127] : t;
+        _icon.Icon = ToIcon(_severityIcon);
+        _icon.Text = TrayStatePresenter.StatusTooltip(_status);
     }
 
-    private void OnProgressFileEvent(object? sender, FileSystemEventArgs? e)
+    private async Task OnProgressChangedAsync()
     {
-        if (_icon.ContextMenuStrip?.InvokeRequired == true)
-        {
-            _icon.ContextMenuStrip.BeginInvoke(() => OnProgressFileEvent(sender, e));
-            return;
-        }
-
-        if (!File.Exists(ProgressPath))
-        {
-            return;
-        }
-
-        AnalysisProgress? progress = null;
-        // Retry briefly — file may be mid-write when watcher fires.
-        for (int attempt = 0; attempt < 3 && progress is null; attempt++)
-        {
-            try
-            {
-                var json = File.ReadAllText(ProgressPath);
-                if (!string.IsNullOrWhiteSpace(json))
-                    progress = JsonSerializer.Deserialize<AnalysisProgress>(json, JsonOpts);
-            }
-            catch
-            {
-                Thread.Sleep(80);
-            }
-        }
+        var progress = await JsonFileReader.ReadAsync<AnalysisProgress>(_paths.ProgressFile);
         if (progress is null) return;
-
-        var previousState = _currentProgress?.State;
-        _currentProgress = progress;
-
-        // Swap to busy icon
-        _icon.Icon = SystemIcons.Information;
-
-        // Transition toast: scanning → analyzing
-        if (previousState == "scanning" && progress.State == "analyzing")
+        OnUi(() =>
         {
-            _icon.ShowBalloonTip(4000, "SecAgent",
-                $"Scan concluído. {progress.Step}, aguarde ~1 min...",
-                ToolTipIcon.Info);
-        }
+            // T3: progress.json órfão (Service caiu no meio do scan) não prende o ícone.
+            if (TrayStatePresenter.IsStale(progress, DateTime.UtcNow)) { OnProgressDeleted(); return; }
 
-        _previousProgressState = progress.State;
-
-        if (!_progressTimer.Enabled) _progressTimer.Start();
-        UpdateProgressTooltip();
+            var previous = _currentProgress?.State;
+            _currentProgress = progress;
+            _icon.Icon = ToIcon(TrayIconKind.Busy);
+            ShowToast(TrayStatePresenter.TransitionToast(previous, progress), 4000);
+            if (!_progressTimer.Enabled) _progressTimer.Start();
+            UpdateProgressTooltip();
+        });
     }
 
-    private void OnProgressFileDeleted(object? sender, FileSystemEventArgs e)
+    private void OnProgressDeleted()
     {
-        if (_icon.ContextMenuStrip?.InvokeRequired == true)
-        {
-            _icon.ContextMenuStrip.BeginInvoke(() => OnProgressFileDeleted(sender, e));
-            return;
-        }
-
         _currentProgress = null;
-        _previousProgressState = null;
         _progressTimer.Stop();
-
-        // Restore severity icon and normal tooltip
-        _icon.Icon = _severityIcon;
-        if (_status is not null) _icon.Text = BuildStatusTooltip(_status);
-        else _icon.Text = "SecAgent";
+        ShowIdle();
     }
 
     private void UpdateProgressTooltip()
     {
         if (_currentProgress is null) return;
-        var elapsed = (int)(DateTime.UtcNow - _currentProgress.StartedAtUtc).TotalSeconds;
-        if (elapsed < 0) elapsed = 0;
-
-        var label = _currentProgress.State == "analyzing"
-            ? $"SecAgent — {_currentProgress.Step}... {elapsed}s"
-            : $"SecAgent — {_currentProgress.Step}... {elapsed}s";
-
-        _icon.Text = label.Length > 127 ? label[..127] : label;
+        if (TrayStatePresenter.IsStale(_currentProgress, DateTime.UtcNow)) { OnProgressDeleted(); return; }
+        _icon.Text = TrayStatePresenter.ProgressTooltip(_currentProgress, DateTime.UtcNow);
     }
+
+    // ---- watchers -----------------------------------------------------------
+
+    private void OnNewReport(FileSystemEventArgs e)
+    {
+        ShowToast(TrayStatePresenter.ReportToast(e.Name), 7000);
+        _ = RefreshStatusAsync();
+    }
+
+    private void OnNewScan(FileSystemEventArgs e)
+        => OnUi(() => ShowToast(TrayStatePresenter.ScanToast(e.Name, _currentProgress), 4000));
+
+    private async Task OnNewAlertAsync(string path)
+    {
+        try
+        {
+            var alert = await JsonFileReader.ReadAsync<NetworkAlert>(path);
+            if (alert is null) return;
+            // País: cache = instantâneo; senão timeout curto.
+            var geo = await _geo.ResolveNowAsync(alert.RemoteAddress);
+            ShowToast(TrayStatePresenter.AlertToast(alert, geo?.Country, geo?.CountryCode), 8000);
+        }
+        catch { /* toast é best effort */ }
+    }
+
+    // ---- abrir arquivos -----------------------------------------------------
 
     private void OpenLast(string pattern)
     {
         try
         {
-            var last = new DirectoryInfo(ReportsDir).GetFiles(pattern)
+            var last = new DirectoryInfo(_paths.ReportsDir).GetFiles(pattern)
                 .OrderByDescending(f => f.LastWriteTimeUtc)
                 .FirstOrDefault();
-            if (last is null)
-            {
-                _icon.ShowBalloonTip(3000, "SecAgent",
-                    $"Nenhum arquivo encontrado para padrão {pattern}", ToolTipIcon.Info);
-                return;
-            }
-            OpenFile(last.FullName);
+            if (last is null) { Info($"Nenhum arquivo encontrado para padrão {pattern}"); return; }
+            Process.Start(new ProcessStartInfo(last.FullName) { UseShellExecute = true });
         }
         catch (Exception ex)
         {
-            _icon.ShowBalloonTip(3000, "SecAgent", $"Erro abrindo último relatório: {ex.Message}", ToolTipIcon.Error);
+            Info($"Erro abrindo último relatório: {ex.Message}", error: true);
         }
     }
-
-    private static void OpenFile(string path)
-        => Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
 
     private static void OpenFolder(string path)
     {
         Directory.CreateDirectory(path);
         Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
-    }
-
-    private void OnNewReport(object sender, FileSystemEventArgs e)
-    {
-        if (_icon.ContextMenuStrip?.InvokeRequired == true)
-        {
-            _icon.ContextMenuStrip.BeginInvoke(() => OnNewReport(sender, e));
-            return;
-        }
-
-        var name = e.Name ?? "";
-        bool isIncident = name.StartsWith("incident_", StringComparison.OrdinalIgnoreCase);
-        var title = isIncident ? "SecAgent: novo incidente detectado" : "SecAgent: novo relatório de scan";
-        _icon.ShowBalloonTip(7000, title, name, isIncident ? ToolTipIcon.Warning : ToolTipIcon.Info);
-        RefreshStatus();
-    }
-
-    private async void OnNewAlert(object sender, FileSystemEventArgs e)
-    {
-        var alert = ReadAlert(e.FullPath);
-        if (alert is null) return;
-
-        // Enrich with country (cache hit = instant; bounded timeout otherwise).
-        GeoLookup.GeoInfo? geo = null;
-        try { geo = await _geo.ResolveNowAsync(alert.RemoteAddress); } catch { }
-
-        var loc = geo is not null
-            ? $"{Flag(geo.CountryCode)} {geo.Country}".Trim() + " · "
-            : "";
-        var text = loc + alert.Message;
-        var icon = string.Equals(alert.Severity, "critical", StringComparison.OrdinalIgnoreCase)
-            ? ToolTipIcon.Error : ToolTipIcon.Warning;
-
-        void Show() => _icon.ShowBalloonTip(8000, "SecAgent: " + alert.Title, text, icon);
-        if (_icon.ContextMenuStrip?.InvokeRequired == true)
-            _icon.ContextMenuStrip.BeginInvoke(Show);
-        else
-            Show();
-    }
-
-    private static NetworkAlert? ReadAlert(string path)
-    {
-        for (int attempt = 0; attempt < 3; attempt++)
-        {
-            try
-            {
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var sr = new StreamReader(fs, Encoding.UTF8);
-                var json = sr.ReadToEnd();
-                if (!string.IsNullOrWhiteSpace(json))
-                    return JsonSerializer.Deserialize<NetworkAlert>(json, JsonOpts);
-            }
-            catch { }
-            Thread.Sleep(80);
-        }
-        return null;
-    }
-
-    private static string Flag(string? cc)
-    {
-        if (string.IsNullOrEmpty(cc) || cc.Length != 2) return "🌐";
-        cc = cc.ToUpperInvariant();
-        return char.ConvertFromUtf32(0x1F1E6 + (cc[0] - 'A')) +
-               char.ConvertFromUtf32(0x1F1E6 + (cc[1] - 'A'));
-    }
-
-    private void OnNewScan(object sender, FileSystemEventArgs e)
-    {
-        if (_icon.ContextMenuStrip?.InvokeRequired == true)
-        {
-            _icon.ContextMenuStrip.BeginInvoke(() => OnNewScan(sender, e));
-            return;
-        }
-
-        // Only surface scan-only completions to avoid double-toast with reports.
-        // Heuristic: if progress is null (scan-only finished and cleared its progress),
-        // or if currentProgress state was "scanning" (no analyze coming), this is a
-        // scan-only run. For scan+analyze the progress will transition to "analyzing"
-        // and the final report toast handles it.
-        if (_currentProgress is null || _currentProgress.State == "scanning")
-        {
-            _icon.ShowBalloonTip(4000, "SecAgent",
-                "Snapshot capturado: " + (e.Name ?? ""),
-                ToolTipIcon.Info);
-        }
     }
 
     protected override void Dispose(bool disposing)
@@ -554,10 +341,7 @@ public class TrayApplicationContext : ApplicationContext
             _icon.Dispose();
             _statusTimer.Dispose();
             _progressTimer.Dispose();
-            _reportWatcher?.Dispose();
-            _scanWatcher?.Dispose();
-            _progressWatcher?.Dispose();
-            _alertWatcher?.Dispose();
+            foreach (var w in _watchers) w.Dispose();
             _dataPump?.Dispose();
             _dashboard?.Dispose();
             _geo.Dispose();

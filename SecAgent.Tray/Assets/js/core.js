@@ -20,22 +20,28 @@ class Severity {
 // ---- formatação genérica ----
 class Format {
   // Escapa HTML para prevenir XSS ao injetar texto vindo do Service via innerHTML.
+  // Aspas também: o resultado vai para atributos (ex.: data-ip="...").
   static esc(s) {
     return (s == null ? '' : String(s))
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   // Código de país de 2 letras -> emoji de bandeira (ex.: "BR" -> 🇧🇷).
   static flag(cc) {
     if (!cc || cc.length !== 2) return '🌐';
+    cc = String(cc).toUpperCase();
+    if (!/^[A-Z]{2}$/.test(cc)) return '🌐';
     const A = 0x1F1E6;
     return String.fromCodePoint(A + cc.charCodeAt(0) - 65, A + cc.charCodeAt(1) - 65);
   }
 
   // ISO timestamp -> "HH:mm:ss" em pt-BR; string vazia se inválido.
+  // (new Date(lixo) não lança: vira "Invalid Date" — por isso o isNaN.)
   static time(iso) {
-    try { return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
-    catch (e) { return ''; }
+    const d = new Date(iso);
+    if (iso == null || isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
 
   // bytes/s -> texto amigável (—, KB/s, MB/s) com locale pt-BR. Usado tanto na
