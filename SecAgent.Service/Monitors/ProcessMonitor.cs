@@ -1,37 +1,37 @@
-using System.Management;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
-using SecAgent.Service.Models;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Monitors;
 
-using SecAgent.Service;
-
 /// <summary>
-/// Listens for process creation via WMI __InstanceCreationEvent on Win32_Process.
-/// Emits a SecurityEvent only when the process runs from a suspicious path
-/// (Temp/Downloads/etc.) and is not on the whitelist. Other process starts are
-/// dropped to keep noise down.
+/// Escuta criação de processos (WMI) e emite um SecurityEvent só quando o
+/// executável roda de um caminho suspeito (Temp/Downloads/etc.) e não está no
+/// whitelist. Demais processos são descartados para manter o ruído baixo.
 /// </summary>
 public class ProcessMonitor : BackgroundService
 {
     private readonly ILogger<ProcessMonitor> _logger;
     private readonly ChannelWriter<SecurityEvent> _writer;
     private readonly MonitorOptions _opts;
-    private readonly HashSet<string> _whitelist;
-    private ManagementEventWatcher? _watcher;
+    private readonly IProcessStartSource _source;
+    private readonly ProcessStartEvaluator _evaluator;
+    private readonly TimeProvider _time;
 
     public ProcessMonitor(
         ILogger<ProcessMonitor> logger,
-        Channel<SecurityEvent> channel,
-        IOptions<MonitorOptions> opts)
+        ChannelWriter<SecurityEvent> writer,
+        IOptions<MonitorOptions> opts,
+        IProcessStartSource source,
+        ISystemEnvironment env,
+        TimeProvider time)
     {
         _logger = logger;
-        _writer = channel.Writer;
+        _writer = writer;
         _opts = opts.Value;
-        _whitelist = new HashSet<string>(
-            _opts.ProcessWhitelist.Select(s => s.ToLowerInvariant()),
-            StringComparer.OrdinalIgnoreCase);
+        _source = source;
+        _time = time;
+        _evaluator = new ProcessStartEvaluator(_opts, env.BaseDirectory);
     }
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken)
@@ -44,12 +44,8 @@ public class ProcessMonitor : BackgroundService
 
         try
         {
-            var query = new WqlEventQuery(
-                "SELECT TargetInstance FROM __InstanceCreationEvent WITHIN 2 " +
-                "WHERE TargetInstance ISA 'Win32_Process'");
-            _watcher = new ManagementEventWatcher(query);
-            _watcher.EventArrived += OnProcessStarted;
-            _watcher.Start();
+            _source.ProcessStarted += OnProcessStarted;
+            _source.Start();
             _logger.LogInformation("ProcessMonitor started (watching __InstanceCreationEvent every 2s)");
         }
         catch (Exception ex)
@@ -59,46 +55,17 @@ public class ProcessMonitor : BackgroundService
         }
 
         return Task.Delay(Timeout.Infinite, stoppingToken)
-            .ContinueWith(_ => { try { _watcher?.Stop(); } catch { } }, TaskScheduler.Default);
+            .ContinueWith(_ => _source.Stop(), TaskScheduler.Default);
     }
 
-    private void OnProcessStarted(object? sender, EventArrivedEventArgs e)
+    internal void OnProcessStarted(ProcessStartData data)
     {
         try
         {
-            using var instance = (ManagementBaseObject)e.NewEvent["TargetInstance"];
-            var name = (instance["Name"] as string ?? "").ToLowerInvariant();
-            if (string.IsNullOrEmpty(name) || _whitelist.Contains(name)) return;
-
-            var path = instance["ExecutablePath"] as string;
-            if (string.IsNullOrEmpty(path)) return;  // protected process or race; skip
-
-            if (_opts.SelfReferenceFragments.Any(f =>
-                    path.Contains(f, StringComparison.OrdinalIgnoreCase)))
-                return;
-
-            var matchedFragment = _opts.SuspiciousPathFragments
-                .FirstOrDefault(f => path.Contains(f, StringComparison.OrdinalIgnoreCase));
-            if (matchedFragment is null) return;  // not suspicious enough to surface
-
-            var evt = new SecurityEvent(
-                TimestampUtc: DateTime.UtcNow,
-                Source: "process",
-                Severity: "high",
-                Title: $"Process from suspicious path: {name}",
-                Description: $"Executable launched from path containing '{matchedFragment}', a common staging location for malware.",
-                Details: new Dictionary<string, string>
-                {
-                    ["name"] = name,
-                    ["pid"] = instance["ProcessId"]?.ToString() ?? "",
-                    ["parentPid"] = instance["ParentProcessId"]?.ToString() ?? "",
-                    ["path"] = path,
-                    ["commandLine"] = (instance["CommandLine"] as string ?? "").Truncate(500),
-                    ["fragment"] = matchedFragment
-                });
-
+            var evt = _evaluator.Evaluate(data, _time.GetUtcNow().UtcDateTime);
+            if (evt is null) return;
             _writer.TryWrite(evt);
-            _logger.LogInformation("Suspicious process emitted: {Name} from {Path}", name, path);
+            _logger.LogInformation("Suspicious process emitted: {Name} from {Path}", data.Name, data.ExecutablePath);
         }
         catch (Exception ex)
         {
@@ -108,8 +75,78 @@ public class ProcessMonitor : BackgroundService
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        try { _watcher?.Stop(); _watcher?.Dispose(); } catch { }
+        try { _source.ProcessStarted -= OnProcessStarted; _source.Dispose(); } catch { }
         await base.StopAsync(cancellationToken);
     }
 }
 
+/// <summary>
+/// Regra pura do ProcessMonitor. Auto-referência agora é estrita: (a) executável
+/// sob a pasta de instalação do agente, ou (b) NOME do executável contendo um
+/// fragmento (ex.: SecAgent-Setup.exe em Downloads). Antes bastava o CAMINHO
+/// conter "SecAgent" — <c>Downloads\SecAgent\malware.exe</c> passava batido.
+/// </summary>
+internal sealed class ProcessStartEvaluator
+{
+    private readonly HashSet<string> _whitelist;
+    private readonly List<string> _selfNameFragments;
+    private readonly List<string> _selfDirs;
+    private readonly List<string> _suspicious;
+
+    public ProcessStartEvaluator(MonitorOptions opts, string serviceBaseDirectory)
+    {
+        _whitelist = new HashSet<string>(opts.ProcessWhitelist ?? new(), StringComparer.OrdinalIgnoreCase);
+        _selfNameFragments = (opts.SelfReferenceFragments ?? new()).Where(f => !string.IsNullOrWhiteSpace(f)).ToList();
+        _suspicious = opts.SuspiciousPathFragments ?? MonitorOptions.DefaultSuspiciousPathFragments.ToList();
+
+        var dirs = (opts.SelfInstallDirectories ?? new()).Where(d => !string.IsNullOrWhiteSpace(d)).ToList();
+        if (dirs.Count == 0 && DefaultInstallRoot(serviceBaseDirectory) is { } root) dirs.Add(root);
+        _selfDirs = dirs.Select(NormalizeDir).ToList();
+    }
+
+    /// <summary>Pasta-pai do executável do Service ({app}\Service → {app}, cobrindo também {app}\Tray).</summary>
+    internal static string? DefaultInstallRoot(string baseDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(baseDirectory)) return null;
+        var trimmed = baseDirectory.TrimEnd('\\', '/');
+        return Path.GetDirectoryName(trimmed) ?? trimmed;
+    }
+
+    private static string NormalizeDir(string d) => d.TrimEnd('\\', '/') + "\\";
+
+    public bool IsSelf(string path)
+    {
+        var fileName = Path.GetFileName(path);
+        if (_selfNameFragments.Any(f => fileName.Contains(f, StringComparison.OrdinalIgnoreCase))) return true;
+        return _selfDirs.Any(d => path.StartsWith(d, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public SecurityEvent? Evaluate(ProcessStartData p, DateTime nowUtc)
+    {
+        var name = (p.Name ?? "").ToLowerInvariant();
+        if (string.IsNullOrEmpty(name) || _whitelist.Contains(name)) return null;
+
+        var path = p.ExecutablePath;
+        if (string.IsNullOrEmpty(path)) return null;   // processo protegido ou corrida; ignora
+        if (IsSelf(path)) return null;
+
+        var fragment = _suspicious.FirstOrDefault(f => path.Contains(f, StringComparison.OrdinalIgnoreCase));
+        if (fragment is null) return null;              // não é suspeito o bastante
+
+        return new SecurityEvent(
+            TimestampUtc: nowUtc,
+            Source: "process",
+            Severity: SeverityLevels.High,
+            Title: $"Process from suspicious path: {name}",
+            Description: $"Executable launched from path containing '{fragment}', a common staging location for malware.",
+            Details: new Dictionary<string, string>
+            {
+                ["name"] = name,
+                ["pid"] = p.ProcessId ?? "",
+                ["parentPid"] = p.ParentProcessId ?? "",
+                ["path"] = path,
+                ["commandLine"] = (p.CommandLine ?? "").Truncate(500),
+                ["fragment"] = fragment
+            });
+    }
+}

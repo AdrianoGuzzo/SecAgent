@@ -1,24 +1,19 @@
-using System.Net.NetworkInformation;
 using SecAgent.Service.Models;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Collectors;
 
+/// <summary>Listeners TCP/UDP ativos.</summary>
 public class OpenPortsCollector
 {
+    private readonly INetworkInfo _net;
+
+    public OpenPortsCollector(INetworkInfo net) => _net = net;
+
     public List<OpenPort> Collect()
-    {
-        var result = new List<OpenPort>();
-        var props = IPGlobalProperties.GetIPGlobalProperties();
-
-        foreach (var ep in props.GetActiveTcpListeners())
-            result.Add(new OpenPort("TCP", ep.Address.ToString(), ep.Port, null, null));
-
-        foreach (var ep in props.GetActiveUdpListeners())
-            result.Add(new OpenPort("UDP", ep.Address.ToString(), ep.Port, null, null));
-
-        return result
+        => _net.GetTcpListeners().Select(ep => new OpenPort("TCP", ep.Address.ToString(), ep.Port, null, null))
+            .Concat(_net.GetUdpListeners().Select(ep => new OpenPort("UDP", ep.Address.ToString(), ep.Port, null, null)))
             .OrderBy(p => p.Protocol)
             .ThenBy(p => p.LocalPort)
             .ToList();
-    }
 }

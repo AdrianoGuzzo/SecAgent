@@ -1,91 +1,103 @@
-using System.Diagnostics;
-using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
+using SecAgent.Service.Diagnostics;
 using SecAgent.Service.Models;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Analysis;
 
-using SecAgent.Service;
-
-public class ClaudeAnalyzer
+public interface IClaudeAnalyzer
 {
-    private static readonly JsonSerializerOptions WriteOpts = new()
-    {
-        WriteIndented = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+    Task<AnalysisResult> AnalyzeAsync(ScanResult scan, string scanFilePath, CancellationToken ct,
+        string? model = null, string? effort = null);
 
-    private static readonly JsonSerializerOptions ReadOpts = new()
-    {
-        PropertyNameCaseInsensitive = true
-    };
+    Task<IncidentReport> AnalyzeIncidentAsync(IReadOnlyList<SecurityEvent> events,
+        DateTime windowStartUtc, DateTime windowEndUtc, CancellationToken ct);
+}
 
-    private const string SystemPrompt =
-        "Você é um analista de segurança defensiva especializado em sistemas Windows. " +
-        "Responda exatamente no formato JSON solicitado, sem markdown, sem texto fora do JSON.";
+/// <summary>
+/// Orquestra a análise com IA: monta o prompt, invoca o claude CLI (via
+/// <see cref="IClaudeCli"/>), interpreta a resposta e persiste JSON + Markdown.
+/// Toda a parte pura vive em <see cref="ClaudeArgsBuilder"/>,
+/// <see cref="ClaudeResponseParser"/>, <see cref="PromptBuilder"/> e
+/// <see cref="ReportMarkdownRenderer"/>.
+/// </summary>
+public class ClaudeAnalyzer : IClaudeAnalyzer
+{
+    private const string TraceCategory = "analyzer";
 
     private readonly ILogger<ClaudeAnalyzer> _logger;
     private readonly ClaudeOptions _opts;
-    private readonly StatusFileService _status;
+    private readonly IStatusFileService _status;
+    private readonly IClaudeCli _cli;
+    private readonly ISystemEnvironment _env;
+    private readonly ITraceLog _trace;
+    private readonly TimeProvider _time;
 
-    public ClaudeAnalyzer(ILogger<ClaudeAnalyzer> logger, IOptions<ClaudeOptions> opts, StatusFileService status)
+    public ClaudeAnalyzer(
+        ILogger<ClaudeAnalyzer> logger,
+        IOptions<ClaudeOptions> opts,
+        IStatusFileService status,
+        IClaudeCli cli,
+        ISystemEnvironment env,
+        ITraceLog trace,
+        TimeProvider time)
     {
         _logger = logger;
         _opts = opts.Value;
         _status = status;
+        _cli = cli;
+        _env = env;
+        _trace = trace;
+        _time = time;
     }
 
+    private DateTime UtcNow => _time.GetUtcNow().UtcDateTime;
+
     // ============================================================
-    // Scan analysis (daily)
+    // Scan analysis
     // ============================================================
 
     // model/effort são opcionais: quando vêm do trigger (escolha do usuário no
-    // painel) sobrepõem os defaults de config. Já chegam validados pelo ScanRunner,
-    // mas normalizamos de novo aqui por segurança (fallback nos defaults).
+    // painel) sobrepõem os defaults de config. Normalizados aqui de novo por
+    // segurança (o conteúdo do trigger é gravável por qualquer usuário).
     public async Task<AnalysisResult> AnalyzeAsync(
         ScanResult scan, string scanFilePath, CancellationToken ct,
         string? model = null, string? effort = null)
     {
         Directory.CreateDirectory(_opts.ReportsDirectory);
 
-        var useModel = ClaudeCapabilities.NormalizeModel(model, _opts.Model);
-        var useEffort = ClaudeCapabilities.NormalizeEffort(effort, _opts.Effort);
+        var useModel = AiModels.NormalizeModel(model, _opts.Model);
+        var useEffort = AiModels.NormalizeEffort(effort, _opts.Effort);
+        var scanFile = Path.GetFileName(scanFilePath);
 
-        var (envelope, elapsedMs, error) = await InvokeClaudeAsync(PromptBuilder.Build(scan), ct, useModel, useEffort);
-        if (error != null)
-            return ScanFailure(scanFilePath, error, elapsedMs, useModel, useEffort);
+        var (envelope, elapsedMs, error) = await InvokeClaudeAsync(PromptBuilder.Build(scan), useModel, useEffort, ct);
+        if (envelope is null)
+            return ScanFailure(scanFile, error!, ClaudeResponseParser.EmptyMeta(useModel, useEffort, elapsedMs));
 
-        var meta = ToMeta(envelope!, elapsedMs, useModel, useEffort);
+        var meta = ClaudeResponseParser.ToMeta(envelope, elapsedMs, useModel, useEffort);
+        if (envelope.IsError || string.IsNullOrWhiteSpace(envelope.Result))
+            return ScanFailure(scanFile, $"Claude reported error: {envelope.Result ?? "(empty)"}", meta);
 
-        if (envelope!.IsError || string.IsNullOrWhiteSpace(envelope.Result))
-            return ScanFailure(scanFilePath, $"Claude reported error: {envelope.Result ?? "(empty)"}", elapsedMs, useModel, useEffort, meta);
-
-        var raw = StripCodeFence(envelope.Result.Trim());
+        var raw = ClaudeResponseParser.StripCodeFence(envelope.Result.Trim());
         ClaudeAnalysisPayload? payload;
         try
         {
-            payload = JsonSerializer.Deserialize<ClaudeAnalysisPayload>(raw, ReadOpts);
+            payload = ClaudeResponseParser.ParseScanPayload(raw);
         }
         catch (JsonException ex)
         {
             _logger.LogError(ex, "Could not parse scan analysis payload");
-            SaveRawFailure(raw, "scan", scanFilePath);
-            return ScanFailure(scanFilePath, $"Payload parse error: {ex.Message}", elapsedMs, meta.Model, meta.Effort, meta);
+            SaveRawFailure(raw, "scan", scanFile);
+            return ScanFailure(scanFile, $"Payload parse error: {ex.Message}", meta);
         }
 
-        var findings = payload?.Findings?.Select(f => new Finding(
-            f.Severity ?? "info", f.Category ?? "outro",
-            f.Title ?? "(no title)", f.Description ?? "",
-            f.Recommendation ?? "", f.Evidence)).ToList() ?? new();
-
         var result = new AnalysisResult(
-            TimestampUtc: DateTime.UtcNow,
-            ScanFile: Path.GetFileName(scanFilePath),
-            RiskLevel: payload?.RiskLevel ?? "unknown",
+            TimestampUtc: UtcNow,
+            ScanFile: scanFile,
+            RiskLevel: payload?.RiskLevel ?? SeverityLevels.Unknown,
             Summary: payload?.Summary ?? "",
-            Findings: findings,
+            Findings: ClaudeResponseParser.ToFindings(payload),
             Meta: meta);
 
         PersistScanReport(result);
@@ -94,11 +106,10 @@ public class ClaudeAnalyzer
 
     private void PersistScanReport(AnalysisResult r)
     {
-        var ts = r.TimestampUtc.ToString("yyyy-MM-dd_HHmmss");
-        var jsonPath = Path.Combine(_opts.ReportsDirectory, $"report_{ts}.json");
-        var mdPath = Path.Combine(_opts.ReportsDirectory, $"report_{ts}.md");
-        File.WriteAllText(jsonPath, JsonSerializer.Serialize(r, WriteOpts));
-        File.WriteAllText(mdPath, RenderScanMarkdown(r));
+        var jsonPath = Path.Combine(_opts.ReportsDirectory, ReportNames.ScanReportJson(r.TimestampUtc));
+        var mdPath = Path.Combine(_opts.ReportsDirectory, ReportNames.ScanReportMarkdown(r.TimestampUtc));
+        File.WriteAllText(jsonPath, JsonSerializer.Serialize(r, JsonDefaults.Indented));
+        File.WriteAllText(mdPath, ReportMarkdownRenderer.RenderScan(r));
         _status.UpdateAfterScan(r);
         _logger.LogInformation(
             "Scan report saved. risk={Risk} findings={N} tokens(in/cc/cr/out)={In}/{CC}/{CR}/{Out} cost=${Cost} → {Md}",
@@ -107,41 +118,12 @@ public class ClaudeAnalyzer
             r.Meta.OutputTokens, r.Meta.TotalCostUsd, mdPath);
     }
 
-    private static string RenderScanMarkdown(AnalysisResult r)
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine($"# Security Analysis — {r.TimestampUtc:yyyy-MM-dd HH:mm} UTC");
-        sb.AppendLine();
-        sb.AppendLine($"- **Risk level:** {r.RiskLevel}");
-        sb.AppendLine($"- **Scan source:** `{r.ScanFile}`");
-        sb.AppendLine($"- **Model:** {r.Meta.Model}{(r.Meta.Effort is null ? "" : $" (effort: {r.Meta.Effort})")}  |  elapsed: {r.Meta.ElapsedMs}ms  |  tokens (in/cc/cr/out): {r.Meta.InputTokens}/{r.Meta.CacheCreationTokens}/{r.Meta.CacheReadTokens}/{r.Meta.OutputTokens}  |  cost: ${r.Meta.TotalCostUsd}");
-        sb.AppendLine();
-        sb.AppendLine("## Summary");
-        sb.AppendLine(r.Summary);
-        sb.AppendLine();
-        sb.AppendLine($"## Findings ({r.Findings.Count})");
-        if (r.Findings.Count == 0) sb.AppendLine("_No findings._");
-        foreach (var f in r.Findings.OrderByDescending(f => SeverityRank(f.Severity)))
-        {
-            sb.AppendLine();
-            sb.AppendLine($"### [{f.Severity.ToUpperInvariant()}] {f.Title}");
-            sb.AppendLine($"*Category: {f.Category}*");
-            sb.AppendLine();
-            sb.AppendLine(f.Description);
-            sb.AppendLine();
-            sb.AppendLine($"**Recommendation:** {f.Recommendation}");
-            if (!string.IsNullOrWhiteSpace(f.Evidence))
-                sb.AppendLine($"*Evidence:* `{f.Evidence}`");
-        }
-        return sb.ToString();
-    }
-
     // ============================================================
     // Incident analysis (ad-hoc, triggered by SuspiciousEventProcessor)
     // ============================================================
 
     public async Task<IncidentReport> AnalyzeIncidentAsync(
-        List<SecurityEvent> events,
+        IReadOnlyList<SecurityEvent> events,
         DateTime windowStartUtc,
         DateTime windowEndUtc,
         CancellationToken ct)
@@ -149,41 +131,40 @@ public class ClaudeAnalyzer
         Directory.CreateDirectory(_opts.ReportsDirectory);
 
         // Incidentes são automáticos (sem escolha do usuário): usa os defaults de config.
-        var useModel = ClaudeCapabilities.NormalizeModel(null, _opts.Model);
-        var useEffort = ClaudeCapabilities.NormalizeEffort(null, _opts.Effort);
+        var useModel = AiModels.NormalizeModel(null, _opts.Model);
+        var useEffort = AiModels.NormalizeEffort(null, _opts.Effort);
 
-        var prompt = BuildIncidentPrompt(events, windowStartUtc, windowEndUtc);
-        var (envelope, elapsedMs, error) = await InvokeClaudeAsync(prompt, ct, useModel, useEffort);
+        var prompt = PromptBuilder.BuildIncident(events, windowStartUtc, windowEndUtc);
+        var (envelope, elapsedMs, error) = await InvokeClaudeAsync(prompt, useModel, useEffort, ct);
 
-        if (error != null)
-            return IncidentFailure(events, windowStartUtc, windowEndUtc, error, elapsedMs, useModel, useEffort);
+        if (envelope is null)
+            return IncidentFailure(events, windowStartUtc, windowEndUtc, error!,
+                ClaudeResponseParser.EmptyMeta(useModel, useEffort, elapsedMs));
 
-        var meta = ToMeta(envelope!, elapsedMs, useModel, useEffort);
-
-        if (envelope!.IsError || string.IsNullOrWhiteSpace(envelope.Result))
+        var meta = ClaudeResponseParser.ToMeta(envelope, elapsedMs, useModel, useEffort);
+        if (envelope.IsError || string.IsNullOrWhiteSpace(envelope.Result))
             return IncidentFailure(events, windowStartUtc, windowEndUtc,
-                $"Claude error: {envelope.Result ?? "(empty)"}", elapsedMs, useModel, useEffort, meta);
+                $"Claude error: {envelope.Result ?? "(empty)"}", meta);
 
-        var raw = StripCodeFence(envelope.Result.Trim());
+        var raw = ClaudeResponseParser.StripCodeFence(envelope.Result.Trim());
         ClaudeIncidentPayload? payload;
         try
         {
-            payload = JsonSerializer.Deserialize<ClaudeIncidentPayload>(raw, ReadOpts);
+            payload = ClaudeResponseParser.ParseIncidentPayload(raw);
         }
         catch (JsonException ex)
         {
             _logger.LogError(ex, "Could not parse incident payload");
             SaveRawFailure(raw, "incident", null);
-            return IncidentFailure(events, windowStartUtc, windowEndUtc,
-                $"Payload parse error: {ex.Message}", elapsedMs, meta.Model, meta.Effort, meta);
+            return IncidentFailure(events, windowStartUtc, windowEndUtc, $"Payload parse error: {ex.Message}", meta);
         }
 
         var report = new IncidentReport(
-            TimestampUtc: DateTime.UtcNow,
+            TimestampUtc: UtcNow,
             EventCount: events.Count,
             WindowStartUtc: windowStartUtc,
             WindowEndUtc: windowEndUtc,
-            Severity: payload?.Severity ?? "unknown",
+            Severity: payload?.Severity ?? SeverityLevels.Unknown,
             Title: payload?.Title ?? "(no title)",
             Summary: payload?.Summary ?? "",
             RecommendedActions: payload?.RecommendedActions ?? new(),
@@ -193,51 +174,16 @@ public class ClaudeAnalyzer
         return report;
     }
 
-    private string BuildIncidentPrompt(List<SecurityEvent> events, DateTime start, DateTime end)
+    private void PersistIncidentReport(IncidentReport r, IReadOnlyList<SecurityEvent> events)
     {
-        var minutes = (end - start).TotalMinutes;
-        var slim = events.Select(e => new
-        {
-            t = e.TimestampUtc,
-            src = e.Source,
-            sev = e.Severity,
-            title = e.Title,
-            desc = e.Description,
-            details = e.Details
-        }).ToList();
-        var eventsJson = JsonSerializer.Serialize(slim, new JsonSerializerOptions { WriteIndented = false });
+        var jsonPath = Path.Combine(_opts.ReportsDirectory, ReportNames.IncidentJson(r.TimestampUtc));
+        var mdPath = Path.Combine(_opts.ReportsDirectory, ReportNames.IncidentMarkdown(r.TimestampUtc));
+        // Snapshot dos eventos que dispararam o incidente (forense).
+        var eventsPath = Path.Combine(_opts.ReportsDirectory, ReportNames.IncidentEvents(r.TimestampUtc));
 
-        return $$"""
-            O agente local detectou {{events.Count}} evento(s) suspeito(s) em um sistema Windows
-            na janela {{start:yyyy-MM-dd HH:mm:ss}} UTC -> {{end:yyyy-MM-dd HH:mm:ss}} UTC
-            ({{minutes:F0}} min). Analise se há evidência de ataque coordenado, atividade
-            suspeita, ou se são alarmes falsos. Considere correlações entre os eventos
-            (mesmo processo pai, sequência temporal, mesmo IP, etc.).
-
-            Responda APENAS com um único bloco JSON válido (sem markdown, sem texto antes/depois):
-            {
-              "severity": "info|low|medium|high|critical",
-              "title": "Título curto da incidência (até 80 chars)",
-              "summary": "2-4 frases avaliando se isto é ataque, atividade suspeita, ou normal",
-              "recommended_actions": ["ação 1", "ação 2", "..."]
-            }
-
-            Eventos (JSON):
-            {{eventsJson}}
-            """;
-    }
-
-    private void PersistIncidentReport(IncidentReport r, List<SecurityEvent> events)
-    {
-        var ts = r.TimestampUtc.ToString("yyyy-MM-dd_HHmmss");
-        var jsonPath = Path.Combine(_opts.ReportsDirectory, $"incident_{ts}.json");
-        var mdPath = Path.Combine(_opts.ReportsDirectory, $"incident_{ts}.md");
-        // Snapshot of the events that triggered this incident (forensics)
-        var eventsPath = Path.Combine(_opts.ReportsDirectory, $"incident_{ts}.events.json");
-
-        File.WriteAllText(jsonPath, JsonSerializer.Serialize(r, WriteOpts));
-        File.WriteAllText(mdPath, RenderIncidentMarkdown(r, events));
-        File.WriteAllText(eventsPath, JsonSerializer.Serialize(events, WriteOpts));
+        File.WriteAllText(jsonPath, JsonSerializer.Serialize(r, JsonDefaults.Indented));
+        File.WriteAllText(mdPath, ReportMarkdownRenderer.RenderIncident(r, events));
+        File.WriteAllText(eventsPath, JsonSerializer.Serialize(events, JsonDefaults.Indented));
         _status.UpdateAfterIncident(r);
 
         _logger.LogWarning(
@@ -247,271 +193,69 @@ public class ClaudeAnalyzer
             r.Meta.OutputTokens, r.Meta.TotalCostUsd, mdPath);
     }
 
-    private static string RenderIncidentMarkdown(IncidentReport r, List<SecurityEvent> events)
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine($"# Security Incident — {r.TimestampUtc:yyyy-MM-dd HH:mm} UTC");
-        sb.AppendLine();
-        sb.AppendLine($"- **Severity:** {r.Severity}");
-        sb.AppendLine($"- **Title:** {r.Title}");
-        sb.AppendLine($"- **Window:** {r.WindowStartUtc:HH:mm:ss} → {r.WindowEndUtc:HH:mm:ss} UTC ({(r.WindowEndUtc - r.WindowStartUtc).TotalMinutes:F0} min)");
-        sb.AppendLine($"- **Events:** {r.EventCount}");
-        sb.AppendLine($"- **Model:** {r.Meta.Model}{(r.Meta.Effort is null ? "" : $" (effort: {r.Meta.Effort})")}  |  elapsed: {r.Meta.ElapsedMs}ms  |  tokens (in/cc/cr/out): {r.Meta.InputTokens}/{r.Meta.CacheCreationTokens}/{r.Meta.CacheReadTokens}/{r.Meta.OutputTokens}  |  cost: ${r.Meta.TotalCostUsd}");
-        sb.AppendLine();
-        sb.AppendLine("## Summary");
-        sb.AppendLine(r.Summary);
-        sb.AppendLine();
-        sb.AppendLine("## Recommended actions");
-        if (r.RecommendedActions.Count == 0) sb.AppendLine("_None._");
-        foreach (var a in r.RecommendedActions) sb.AppendLine($"- {a}");
-        sb.AppendLine();
-        sb.AppendLine($"## Events that triggered this incident ({events.Count})");
-        foreach (var e in events.OrderBy(x => x.TimestampUtc))
-        {
-            sb.AppendLine();
-            sb.AppendLine($"### [{e.Severity.ToUpperInvariant()}] {e.Title} _({e.Source}, {e.TimestampUtc:HH:mm:ss})_");
-            sb.AppendLine(e.Description);
-            if (e.Details.Count > 0)
-            {
-                sb.AppendLine();
-                sb.AppendLine("```");
-                foreach (var kv in e.Details.Take(8))
-                    sb.AppendLine($"{kv.Key}: {kv.Value}");
-                sb.AppendLine("```");
-            }
-        }
-        return sb.ToString();
-    }
-
     // ============================================================
     // Low-level invocation (shared by both analyses)
     // ============================================================
 
-    private async Task<(ClaudeJsonResponse? Envelope, long ElapsedMs, string? Error)>
-        InvokeClaudeAsync(string prompt, CancellationToken ct, string model, string effort)
+    private async Task<(ClaudeJsonResponse? Envelope, long ElapsedMs, string? Error)> InvokeClaudeAsync(
+        string prompt, string model, string effort, CancellationToken ct)
     {
-        Trace($"InvokeClaudeAsync entered, prompt size = {prompt.Length} chars, model={model}, effort={effort}");
-        if (!File.Exists(_opts.ExePath))
+        _trace.Write(TraceCategory, $"InvokeClaudeAsync entered, prompt size = {prompt.Length} chars, model={model}, effort={effort}");
+        if (!_env.FileExists(_opts.ExePath))
             return (null, 0, $"claude.exe not found at {_opts.ExePath}");
 
-        var token = Environment.GetEnvironmentVariable(_opts.TokenEnvVarName);
+        var token = _env.GetEnvironmentVariable(_opts.TokenEnvVarName);
         if (string.IsNullOrEmpty(token))
             return (null, 0, $"env var {_opts.TokenEnvVarName} is empty");
-        Trace($"token loaded ({token.Length} chars), about to Process.Start {_opts.ExePath}");
+        _trace.Write(TraceCategory, $"token loaded ({token.Length} chars), starting {_opts.ExePath}");
 
-        // Prompt is piped via stdin to avoid the ~32K Windows command-line length limit.
-        var psi = new ProcessStartInfo(_opts.ExePath)
-        {
-            ArgumentList =
-            {
-                "-p",
-                "--output-format", "json",
-                "--input-format", "text",
-                "--model", model,
-                "--permission-mode", "bypassPermissions",
-                "--system-prompt", SystemPrompt,
-                "--disallowedTools", "*"
-            },
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            // claude.exe emite/consome UTF-8. Sem isto, o .NET usa a code page do
-            // console (CP850/1252) e os acentos chegam corrompidos ("obrigatÃ³ria").
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8,
-            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = _opts.ReportsDirectory
-        };
-        // Haiku não aceita --effort; só passamos o flag em modelos que suportam.
-        if (ClaudeCapabilities.EffortSupported(model) && !string.IsNullOrWhiteSpace(effort))
-        {
-            psi.ArgumentList.Add("--effort");
-            psi.ArgumentList.Add(effort);
-        }
-        psi.Environment[_opts.TokenEnvVarName] = token;
+        var run = await _cli.RunAsync(new ClaudeCliRequest(
+            ExePath: _opts.ExePath,
+            Arguments: ClaudeArgsBuilder.Build(model, effort),
+            Stdin: prompt,
+            Environment: new Dictionary<string, string> { [_opts.TokenEnvVarName] = token },
+            WorkingDirectory: _opts.ReportsDirectory,
+            Timeout: TimeSpan.FromSeconds(_opts.TimeoutSeconds)), ct);
 
-        var sw = Stopwatch.StartNew();
-        Process? process;
-        try { process = Process.Start(psi); }
-        catch (Exception ex)
-        {
-            sw.Stop();
-            Trace($"Process.Start THREW {ex.GetType().Name}: {ex.Message}");
-            return (null, sw.ElapsedMilliseconds, $"Process.Start failed: {ex.Message}");
-        }
-        if (process == null) { Trace("Process.Start returned null"); return (null, sw.ElapsedMilliseconds, "Process.Start returned null"); }
-        Trace($"claude.exe started, PID={process.Id}");
+        _trace.Write(TraceCategory,
+            $"claude finished exit={run.ExitCode?.ToString() ?? "-"} elapsed={run.ElapsedMs}ms " +
+            $"stdoutLen={run.Stdout.Length} stderrLen={run.Stderr.Length} error={run.Error ?? "-"}");
+        if (!string.IsNullOrEmpty(run.Stderr)) _trace.Write(TraceCategory, $"stderr first 500: {run.Stderr.Truncate(500)}");
+        if (!string.IsNullOrEmpty(run.Stdout)) _trace.Write(TraceCategory, $"stdout first 500: {run.Stdout.Truncate(500)}");
 
-        try
-        {
-            await process.StandardInput.WriteAsync(prompt.AsMemory(), ct);
-            process.StandardInput.Close();
-        }
-        catch (Exception ex)
-        {
-            try { process.Kill(true); } catch { }
-            sw.Stop();
-            return (null, sw.ElapsedMilliseconds, $"Failed to send prompt: {ex.Message}");
-        }
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = process.StandardError.ReadToEndAsync(ct);
-
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromSeconds(_opts.TimeoutSeconds));
-
-        try { await process.WaitForExitAsync(cts.Token); }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            try { process.Kill(true); } catch { }
-            sw.Stop();
-            return (null, sw.ElapsedMilliseconds, $"Claude timed out after {_opts.TimeoutSeconds}s");
-        }
-
-        var stdout = await stdoutTask;
-        var stderr = await stderrTask;
-        sw.Stop();
-        Trace($"claude exited code={process.ExitCode} elapsed={sw.ElapsedMilliseconds}ms stdoutLen={stdout.Length} stderrLen={stderr.Length}");
-        if (!string.IsNullOrEmpty(stderr)) Trace($"stderr first 500: {stderr.Truncate(500)}");
-        if (!string.IsNullOrEmpty(stdout)) Trace($"stdout first 500: {stdout.Truncate(500)}");
-        process.Dispose();
-
-        if (!string.IsNullOrWhiteSpace(stderr))
-            _logger.LogDebug("claude stderr: {Err}", stderr.Truncate(500));
-
-        if (string.IsNullOrWhiteSpace(stdout))
-            return (null, sw.ElapsedMilliseconds, "Claude returned empty stdout");
-
-        try
-        {
-            var envelope = JsonSerializer.Deserialize<ClaudeJsonResponse>(stdout);
-            return (envelope, sw.ElapsedMilliseconds, null);
-        }
-        catch (JsonException ex)
-        {
-            return (null, sw.ElapsedMilliseconds, $"Envelope parse error: {ex.Message}");
-        }
+        var outcome = ClaudeResponseParser.ParseEnvelope(run);
+        return (outcome.Envelope, run.ElapsedMs, outcome.Error);
     }
 
     // ============================================================
-    // Helpers
+    // Failures
     // ============================================================
 
-    private static AnalysisMeta ToMeta(ClaudeJsonResponse envelope, long elapsedMs, string model, string effort) => new(
-        Model: model,
-        ElapsedMs: elapsedMs,
-        InputTokens: envelope.Usage?.InputTokens,
-        OutputTokens: envelope.Usage?.OutputTokens,
-        CacheCreationTokens: envelope.Usage?.CacheCreationInputTokens,
-        CacheReadTokens: envelope.Usage?.CacheReadInputTokens,
-        TotalCostUsd: envelope.TotalCostUsd,
-        SessionId: envelope.SessionId,
-        IsError: envelope.IsError,
-        // Só registra o esforço quando ele foi de fato aplicado (não em Haiku).
-        Effort: ClaudeCapabilities.EffortSupported(model) ? effort : null);
-
-    private static AnalysisMeta EmptyMeta(string model, string? effort, long elapsedMs) =>
-        new(model, elapsedMs, null, null, null, null, null, null, IsError: true,
-            Effort: ClaudeCapabilities.EffortSupported(model) ? effort : null);
-
-    private AnalysisResult ScanFailure(string scanFilePath, string msg, long elapsedMs,
-        string model, string? effort, AnalysisMeta? meta = null)
+    private AnalysisResult ScanFailure(string scanFile, string msg, AnalysisMeta meta)
     {
         _logger.LogWarning("Scan analysis failed: {Msg}", msg);
-        return new AnalysisResult(DateTime.UtcNow, scanFilePath, "unknown", msg,
-            new(), meta ?? EmptyMeta(model, effort, elapsedMs));
+        // ScanFile só com o NOME (igual ao caminho de sucesso) — antes ia o caminho completo.
+        return new AnalysisResult(UtcNow, scanFile, SeverityLevels.Unknown, msg, new(), meta);
     }
 
     private IncidentReport IncidentFailure(
-        List<SecurityEvent> events, DateTime start, DateTime end,
-        string msg, long elapsedMs, string model, string? effort, AnalysisMeta? meta = null)
+        IReadOnlyList<SecurityEvent> events, DateTime start, DateTime end, string msg, AnalysisMeta meta)
     {
         _logger.LogWarning("Incident analysis failed: {Msg}", msg);
-        return new IncidentReport(DateTime.UtcNow, events.Count, start, end,
-            "unknown", "Analysis failure", msg, new(), meta ?? EmptyMeta(model, effort, elapsedMs));
-    }
-
-    private static int SeverityRank(string s) => s.ToLowerInvariant() switch
-    {
-        "critical" => 4, "high" => 3, "medium" => 2, "low" => 1, _ => 0
-    };
-
-    private static string StripCodeFence(string s)
-    {
-        if (s.StartsWith("```"))
-        {
-            var firstNl = s.IndexOf('\n');
-            if (firstNl > 0) s = s[(firstNl + 1)..];
-            if (s.EndsWith("```")) s = s[..^3].TrimEnd();
-        }
-        return s;
-    }
-
-    private static readonly object _traceLock = new();
-    private static void Trace(string msg)
-    {
-        try
-        {
-            lock (_traceLock)
-            {
-                File.AppendAllText(@"C:\ProgramData\SecAgent\trace.log",
-                    $"[{DateTime.Now:HH:mm:ss.fff}] [analyzer] {msg}{Environment.NewLine}");
-            }
-        }
-        catch { }
+        return new IncidentReport(UtcNow, events.Count, start, end,
+            SeverityLevels.Unknown, "Analysis failure", msg, new(), meta);
     }
 
     private void SaveRawFailure(string raw, string kind, string? context)
     {
         try
         {
-            var path = Path.Combine(_opts.ReportsDirectory,
-                $"{kind}_FAILED_{DateTime.UtcNow:yyyy-MM-dd_HHmmss}.raw.txt");
+            var path = Path.Combine(_opts.ReportsDirectory, ReportNames.FailedRaw(kind, UtcNow));
             File.WriteAllText(path, $"Context: {context ?? "(none)"}{Environment.NewLine}---{Environment.NewLine}{raw}");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not save raw failure");
+        }
     }
-
-    // Wire-format records
-
-    private record ClaudeJsonResponse(
-        [property: JsonPropertyName("type")] string? Type,
-        [property: JsonPropertyName("subtype")] string? Subtype,
-        [property: JsonPropertyName("is_error")] bool IsError,
-        [property: JsonPropertyName("result")] string? Result,
-        [property: JsonPropertyName("session_id")] string? SessionId,
-        [property: JsonPropertyName("total_cost_usd")] decimal? TotalCostUsd,
-        [property: JsonPropertyName("usage")] ClaudeUsage? Usage
-    );
-
-    private record ClaudeUsage(
-        [property: JsonPropertyName("input_tokens")] int? InputTokens,
-        [property: JsonPropertyName("output_tokens")] int? OutputTokens,
-        [property: JsonPropertyName("cache_creation_input_tokens")] int? CacheCreationInputTokens,
-        [property: JsonPropertyName("cache_read_input_tokens")] int? CacheReadInputTokens
-    );
-
-    private record ClaudeAnalysisPayload(
-        [property: JsonPropertyName("risk_level")] string? RiskLevel,
-        [property: JsonPropertyName("summary")] string? Summary,
-        [property: JsonPropertyName("findings")] List<ClaudeFinding>? Findings
-    );
-
-    private record ClaudeFinding(
-        [property: JsonPropertyName("severity")] string? Severity,
-        [property: JsonPropertyName("category")] string? Category,
-        [property: JsonPropertyName("title")] string? Title,
-        [property: JsonPropertyName("description")] string? Description,
-        [property: JsonPropertyName("recommendation")] string? Recommendation,
-        [property: JsonPropertyName("evidence")] string? Evidence
-    );
-
-    private record ClaudeIncidentPayload(
-        [property: JsonPropertyName("severity")] string? Severity,
-        [property: JsonPropertyName("title")] string? Title,
-        [property: JsonPropertyName("summary")] string? Summary,
-        [property: JsonPropertyName("recommended_actions")] List<string>? RecommendedActions
-    );
 }

@@ -1,88 +1,60 @@
 using SecAgent.Service.Models;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Collectors;
 
 /// <summary>
-/// Reads enabled inbound Windows Firewall rules via the HNetCfg.FwPolicy2 COM
-/// interface (same API surface used by Get-NetFirewallRule). Filters to
-/// direction=In and enabled=true to keep the payload small and signal-rich.
+/// Regras de ENTRADA habilitadas do Windows Firewall (mesma API do
+/// Get-NetFirewallRule). Filtra direction=In e enabled=true para manter o
+/// payload pequeno e com sinal.
 /// </summary>
 public class FirewallRulesCollector
 {
-    private const int NetFwRuleDirectionIn  = 1;
-    private const int NetFwActionBlock      = 0;
-    private const int NetFwActionAllow      = 1;
-    private const int NetFwProfileDomain    = 1;
-    private const int NetFwProfilePrivate   = 2;
-    private const int NetFwProfilePublic    = 4;
-    private const int NetFwProfileAll       = 0x7FFFFFFF;
+    private readonly IFirewallPolicy _policy;
+
+    public FirewallRulesCollector(IFirewallPolicy policy) => _policy = policy;
 
     public List<FirewallRule> Collect()
+        => _policy.GetRules()
+            .Where(r => r.Direction == FirewallConstants.DirectionIn && r.Enabled)
+            .Select(r => new FirewallRule(
+                Name: r.Name,
+                Action: FirewallMappers.MapAction(r.Action),
+                Protocol: FirewallMappers.MapProtocol(r.Protocol),
+                LocalPorts: r.LocalPorts ?? "*",
+                RemoteAddresses: r.RemoteAddresses ?? "*",
+                Profiles: FirewallMappers.MapProfiles(r.Profiles),
+                Enabled: r.Enabled))
+            .ToList();
+}
+
+/// <summary>Traduções dos códigos NET_FW_* para texto.</summary>
+internal static class FirewallMappers
+{
+    public static string MapAction(int action) => action switch
     {
-        var result = new List<FirewallRule>();
+        FirewallConstants.ActionBlock => "Block",
+        FirewallConstants.ActionAllow => "Allow",
+        _ => $"Action{action}"
+    };
 
-        var t = Type.GetTypeFromProgID("HNetCfg.FwPolicy2");
-        if (t is null) return result;
-
-        dynamic? fw;
-        try { fw = Activator.CreateInstance(t); }
-        catch { return result; }
-        if (fw is null) return result;
-
-        dynamic rules;
-        try { rules = fw.Rules; }
-        catch { return result; }
-
-        foreach (dynamic rule in rules)
-        {
-            try
-            {
-                int direction = (int)rule.Direction;
-                if (direction != NetFwRuleDirectionIn) continue;
-
-                bool enabled = (bool)rule.Enabled;
-                if (!enabled) continue;
-
-                int action = (int)rule.Action;
-                int protocolNum = (int)rule.Protocol;
-                int profiles = (int)rule.Profiles;
-
-                result.Add(new FirewallRule(
-                    Name: (string?)rule.Name ?? "",
-                    Action: action == NetFwActionBlock ? "Block" :
-                            action == NetFwActionAllow ? "Allow" : $"Action{action}",
-                    Protocol: MapProtocol(protocolNum),
-                    LocalPorts: (string?)rule.LocalPorts ?? "*",
-                    RemoteAddresses: (string?)rule.RemoteAddresses ?? "*",
-                    Profiles: MapProfiles(profiles),
-                    Enabled: enabled));
-            }
-            catch
-            {
-                // Skip any rule whose properties throw (some legacy/orphan rules do).
-            }
-        }
-
-        return result;
-    }
-
-    private static string MapProtocol(int p) => p switch
+    public static string MapProtocol(int p) => p switch
     {
         1 => "ICMP",
         6 => "TCP",
         17 => "UDP",
         58 => "ICMPv6",
-        256 => "Any",
+        FirewallConstants.ProtocolAny => "Any",
         _ => $"IP{p}"
     };
 
-    private static List<string> MapProfiles(int mask)
+    public static List<string> MapProfiles(int mask)
     {
-        if (mask == NetFwProfileAll) return new List<string> { "All" };
+        if (mask == FirewallConstants.ProfileAll) return new List<string> { "All" };
         var list = new List<string>();
-        if ((mask & NetFwProfileDomain)  != 0) list.Add("Domain");
-        if ((mask & NetFwProfilePrivate) != 0) list.Add("Private");
-        if ((mask & NetFwProfilePublic)  != 0) list.Add("Public");
+        if ((mask & FirewallConstants.ProfileDomain) != 0) list.Add("Domain");
+        if ((mask & FirewallConstants.ProfilePrivate) != 0) list.Add("Private");
+        if ((mask & FirewallConstants.ProfilePublic) != 0) list.Add("Public");
         return list.Count > 0 ? list : new List<string> { $"Profile{mask}" };
     }
 }

@@ -6,31 +6,39 @@ using SecAgent.Service.Models;
 
 namespace SecAgent.Service;
 
-/// <summary>
-/// Shared orchestration used by both the scheduled Worker and the on-demand
-/// TriggerWatcher. Reports progress to ProgressTracker so the Tray can show
-/// live feedback (tooltip, busy icon, transition toast).
-/// </summary>
-public class ScanRunner
+public interface IScanRunner
 {
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        WriteIndented = true,
-        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-    };
+    /// <summary>Scan sem IA. Null se falhou ou se já havia um scan em andamento.</summary>
+    Task<(ScanResult Result, string ScanPath)?> RunScanOnlyAsync(string trigger, CancellationToken ct);
 
+    /// <summary>Scan + análise Claude. Ignorado se já havia um scan em andamento.</summary>
+    Task RunScanAndAnalyzeAsync(string trigger, CancellationToken ct, string? model = null, string? effort = null);
+}
+
+/// <summary>
+/// Orquestração compartilhada pelo Worker (agendado) e pelo TriggerWatcher (sob
+/// demanda). Reporta progresso ao ProgressTracker para o Tray.
+///
+/// Single-flight: o Worker e um trigger podiam rodar scans ao mesmo tempo —
+/// um sobrescrevia o progress.json do outro, o Clear() de um apagava o arquivo
+/// com o outro ainda rodando, e dois scans no mesmo segundo colidiam no nome.
+/// Agora um pedido que chega durante um scan é logado e descartado.
+/// </summary>
+public class ScanRunner : IScanRunner
+{
     private readonly ILogger<ScanRunner> _logger;
-    private readonly SecurityScanner _scanner;
-    private readonly ClaudeAnalyzer _analyzer;
-    private readonly ProgressTracker _progress;
+    private readonly ISecurityScanner _scanner;
+    private readonly IClaudeAnalyzer _analyzer;
+    private readonly IProgressTracker _progress;
     private readonly ScannerOptions _options;
     private readonly ClaudeOptions _claudeOptions;
+    private readonly SemaphoreSlim _gate = new(1, 1);
 
     public ScanRunner(
         ILogger<ScanRunner> logger,
-        SecurityScanner scanner,
-        ClaudeAnalyzer analyzer,
-        ProgressTracker progress,
+        ISecurityScanner scanner,
+        IClaudeAnalyzer analyzer,
+        IProgressTracker progress,
         IOptions<ScannerOptions> options,
         IOptions<ClaudeOptions> claudeOptions)
     {
@@ -44,44 +52,47 @@ public class ScanRunner
 
     public async Task<(ScanResult Result, string ScanPath)?> RunScanOnlyAsync(string trigger, CancellationToken ct)
     {
-        _progress.BeginScan(trigger);
+        if (!TryEnter(trigger)) return null;
         try
         {
+            _progress.BeginScan(trigger);
             return await DoScanAsync(ct);
         }
         finally
         {
             _progress.Clear();
+            _gate.Release();
         }
     }
 
-    // Always runs Claude after the scan. Used by the manual "scan + análise"
-    // button. Scheduled scans go through the Worker, which decides whether to
-    // analyze (free scan-only by default) — automatic AI is opt-in via config.
+    // Sempre roda o Claude após o scan. Usado pelo botão "scan + análise".
+    // Scans agendados passam pelo Worker, que decide se analisa.
     //
     // model/effort são opcionais: vêm do trigger quando o usuário escolhe no
     // painel; caem nos defaults de config quando ausentes/inválidos.
     public async Task RunScanAndAnalyzeAsync(
         string trigger, CancellationToken ct, string? model = null, string? effort = null)
     {
-        var useModel = ClaudeCapabilities.NormalizeModel(model, _claudeOptions.Model);
-        var useEffort = ClaudeCapabilities.NormalizeEffort(effort, _claudeOptions.Effort);
+        if (!TryEnter(trigger)) return;
 
-        _progress.BeginScan(trigger);
+        var useModel = AiModels.NormalizeModel(model, _claudeOptions.Model);
+        var useEffort = AiModels.NormalizeEffort(effort, _claudeOptions.Effort);
         try
         {
+            _progress.BeginScan(trigger);
             var scan = await DoScanAsync(ct);
             if (scan is null) return;
 
-            _progress.EndScanBeginAnalysis(
-                Path.GetFileName(scan.Value.ScanPath),
-                useModel,
-                trigger);
+            _progress.EndScanBeginAnalysis(Path.GetFileName(scan.Value.ScanPath), useModel, trigger);
 
             try
             {
                 _logger.LogInformation("Invoking Claude analyzer (model={Model}, effort={Effort})", useModel, useEffort);
                 await _analyzer.AnalyzeAsync(scan.Value.Result, scan.Value.ScanPath, ct, useModel, useEffort);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                _logger.LogInformation("Claude analysis cancelled (service stopping)");
             }
             catch (Exception ex)
             {
@@ -91,21 +102,28 @@ public class ScanRunner
         finally
         {
             _progress.Clear();
+            _gate.Release();
         }
+    }
+
+    private bool TryEnter(string trigger)
+    {
+        if (_gate.Wait(0)) return true;
+        _logger.LogWarning("Scan requested by {Trigger} ignored: another scan is already running", trigger);
+        return false;
     }
 
     private async Task<(ScanResult Result, string ScanPath)?> DoScanAsync(CancellationToken ct)
     {
-        Directory.CreateDirectory(_options.OutputDirectory);
         var sw = Stopwatch.StartNew();
         try
         {
+            Directory.CreateDirectory(_options.OutputDirectory);
             var result = await Task.Run(() => _scanner.RunFullScan(), ct);
             sw.Stop();
 
-            var fileName = $"scan_{result.TimestampUtc:yyyy-MM-dd_HHmmss}.json";
-            var path = Path.Combine(_options.OutputDirectory, fileName);
-            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(result, JsonOpts), ct);
+            var path = Path.Combine(_options.OutputDirectory, ReportNames.ScanFile(result.TimestampUtc));
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(result, JsonDefaults.Indented), ct);
 
             _logger.LogInformation(
                 "Scan complete in {Ms}ms. Ports={Ports} Software={Software} Updates={Updates} Users={Users} Admins={Admins} Errors={Errors} → {Path}",
@@ -119,6 +137,12 @@ public class ScanRunner
                 path);
 
             return (result, path);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Parada normal do serviço — não é "Scan failed".
+            _logger.LogInformation("Scan cancelled after {Ms}ms (service stopping)", sw.ElapsedMilliseconds);
+            return null;
         }
         catch (Exception ex)
         {

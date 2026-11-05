@@ -1,31 +1,29 @@
 using System.Text.Json;
-using System.Text.Json.Serialization;
-using Microsoft.Extensions.Options;
-using SecAgent.Service.Models;
 
 namespace SecAgent.Service.Analysis;
 
-/// <summary>
-/// Maintains a single status.json file that the Tray app polls to drive its
-/// icon color and pop toast notifications.
-/// </summary>
-public class StatusFileService
+public interface IStatusFileService
 {
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        WriteIndented = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+    void UpdateAfterScan(AnalysisResult result);
+    void UpdateAfterIncident(IncidentReport report);
+}
 
+/// <summary>
+/// Mantém <c>status.json</c> (read-modify-write), que o Tray lê para a cor do
+/// ícone. Escrita atômica: o Tray polleia a cada 10s e nunca vê JSON pela metade.
+/// </summary>
+public class StatusFileService : IStatusFileService
+{
     private readonly ILogger<StatusFileService> _logger;
+    private readonly TimeProvider _time;
     private readonly string _path;
     private readonly object _lock = new();
 
-    public StatusFileService(ILogger<StatusFileService> logger, IOptions<ClaudeOptions> opts)
+    public StatusFileService(ILogger<StatusFileService> logger, AgentPaths paths, TimeProvider time)
     {
         _logger = logger;
-        var dir = Path.GetDirectoryName(opts.Value.ReportsDirectory) ?? @"C:\ProgramData\SecAgent";
-        _path = Path.Combine(dir, "status.json");
+        _time = time;
+        _path = paths.StatusFile;
     }
 
     public void UpdateAfterScan(AnalysisResult result)
@@ -34,7 +32,7 @@ public class StatusFileService
             result.TimestampUtc,
             result.RiskLevel,
             result.Findings.Count,
-            $"report_{result.TimestampUtc:yyyy-MM-dd_HHmmss}.md");
+            ReportNames.ScanReportMarkdown(result.TimestampUtc));
         Mutate(s => s with { LastScan = snippet });
     }
 
@@ -45,7 +43,7 @@ public class StatusFileService
             report.Severity,
             report.Title,
             report.EventCount,
-            $"incident_{report.TimestampUtc:yyyy-MM-dd_HHmmss}.md");
+            ReportNames.IncidentMarkdown(report.TimestampUtc));
         Mutate(s => s with { LastIncident = snippet });
     }
 
@@ -55,10 +53,11 @@ public class StatusFileService
         {
             try
             {
-                var current = Read() ?? new AgentStatus(DateTime.UtcNow, "green", null, null);
-                var updated = mutator(current) with { LastUpdatedUtc = DateTime.UtcNow };
+                var now = _time.GetUtcNow().UtcDateTime;
+                var current = Read() ?? new AgentStatus(now, SeverityLevels.Green, null, null);
+                var updated = mutator(current) with { LastUpdatedUtc = now };
                 updated = updated with { OverallSeverity = ComputeOverall(updated) };
-                File.WriteAllText(_path, JsonSerializer.Serialize(updated, JsonOpts));
+                AtomicFile.WriteAllText(_path, JsonSerializer.Serialize(updated, JsonDefaults.Indented));
             }
             catch (Exception ex)
             {
@@ -70,26 +69,19 @@ public class StatusFileService
     private AgentStatus? Read()
     {
         if (!File.Exists(_path)) return null;
-        try { return JsonSerializer.Deserialize<AgentStatus>(File.ReadAllText(_path)); }
-        catch { return null; }
+        try { return JsonSerializer.Deserialize<AgentStatus>(File.ReadAllText(_path), JsonDefaults.Read); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "status.json corrompido em {Path}; recriando", _path);
+            return null;
+        }
     }
 
-    private static string ComputeOverall(AgentStatus s)
+    internal static string ComputeOverall(AgentStatus s)
     {
-        var sevs = new List<string>();
-        if (s.LastScan?.RiskLevel is { } r) sevs.Add(r);
-        if (s.LastIncident?.Severity is { } i) sevs.Add(i);
-
-        if (sevs.Any(IsRed))    return "red";
-        if (sevs.Any(IsYellow)) return "yellow";
-        return "green";
+        var lights = new List<string>();
+        if (s.LastScan?.RiskLevel is { } r) lights.Add(SeverityLevels.ToTrafficLight(r));
+        if (s.LastIncident?.Severity is { } i) lights.Add(SeverityLevels.ToTrafficLight(i));
+        return SeverityLevels.Worst(lights);
     }
-
-    private static bool IsRed(string s) =>
-        s.Equals("critical", StringComparison.OrdinalIgnoreCase) ||
-        s.Equals("high", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsYellow(string s) =>
-        s.Equals("medium", StringComparison.OrdinalIgnoreCase) ||
-        s.Equals("unknown", StringComparison.OrdinalIgnoreCase);
 }

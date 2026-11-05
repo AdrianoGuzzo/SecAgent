@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Contratos compartilhados Service <-> Tray: modelos dos arquivos JSON de IPC
+    (C:\ProgramData\SecAgent\*), caminhos, nomes de trigger, vocabulário de
+    modelos/esforço da IA e helpers de I/O. Sem dependências (net8.0 puro) para
+    que o Tray (WinForms) possa referenciar sem puxar WMI/Hosting do Service.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SecAgent.Contracts</RootNamespace>
+  </PropertyGroup>
+
+</Project>

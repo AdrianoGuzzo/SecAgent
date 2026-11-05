@@ -1,13 +1,25 @@
 using Microsoft.Extensions.Options;
 using SecAgent.Service.Collectors;
 using SecAgent.Service.Models;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service;
 
-public class SecurityScanner
+public interface ISecurityScanner
+{
+    ScanResult RunFullScan();
+}
+
+/// <summary>
+/// Roda os 8 coletores em sequência. Cada um é isolado por <see cref="Safe{T}"/>:
+/// uma falha vira <see cref="CollectorError"/> e não derruba o scan inteiro.
+/// </summary>
+public class SecurityScanner : ISecurityScanner
 {
     private readonly ILogger<SecurityScanner> _logger;
     private readonly ScannerOptions _options;
+    private readonly TimeProvider _time;
+    private readonly ISystemEnvironment _env;
     private readonly OpenPortsCollector _ports;
     private readonly InstalledSoftwareCollector _software;
     private readonly FolderPermissionsCollector _folders;
@@ -20,6 +32,8 @@ public class SecurityScanner
     public SecurityScanner(
         ILogger<SecurityScanner> logger,
         IOptions<ScannerOptions> options,
+        TimeProvider time,
+        ISystemEnvironment env,
         OpenPortsCollector ports,
         InstalledSoftwareCollector software,
         FolderPermissionsCollector folders,
@@ -31,6 +45,8 @@ public class SecurityScanner
     {
         _logger = logger;
         _options = options.Value;
+        _time = time;
+        _env = env;
         _ports = ports;
         _software = software;
         _folders = folders;
@@ -52,12 +68,12 @@ public class SecurityScanner
         var firewall      = Safe("Firewall",      () => _firewall.Collect(),                        errors);
         var firewallRules = Safe("FirewallRules", () => _firewallRules.Collect(),                   errors) ?? new();
         var updates       = Safe("Updates",       () => _updates.Collect(),                         errors) ?? new();
-        var (users, admins) = SafeTuple("Users",  () => _users.Collect(),                           errors);
+        var accounts      = Safe("Users",         () => new UserAccountsResult(_users.Collect()),   errors);
 
         return new ScanResult(
-            TimestampUtc: DateTime.UtcNow,
-            MachineName: Environment.MachineName,
-            OsVersion: Environment.OSVersion.VersionString,
+            TimestampUtc: _time.GetUtcNow().UtcDateTime,
+            MachineName: _env.MachineName,
+            OsVersion: _env.OsVersion,
             OpenPorts: ports,
             InstalledSoftware: software,
             FolderPermissions: folders,
@@ -65,11 +81,13 @@ public class SecurityScanner
             Firewall: firewall,
             FirewallRules: firewallRules,
             InstalledUpdates: updates,
-            LocalUsers: users,
-            Administrators: admins,
+            LocalUsers: accounts?.Value.Users ?? new(),
+            Administrators: accounts?.Value.Administrators ?? new(),
             Errors: errors
         );
     }
+
+    private sealed record UserAccountsResult((List<UserAccount> Users, List<string> Administrators) Value);
 
     private T? Safe<T>(string name, Func<T> action, List<CollectorError> errors) where T : class
     {
@@ -79,18 +97,6 @@ public class SecurityScanner
             _logger.LogWarning(ex, "Collector {Name} failed", name);
             errors.Add(new CollectorError(name, $"{ex.GetType().Name}: {ex.Message}"));
             return null;
-        }
-    }
-
-    private (List<UserAccount>, List<string>) SafeTuple(string name,
-        Func<(List<UserAccount>, List<string>)> action, List<CollectorError> errors)
-    {
-        try { return action(); }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Collector {Name} failed", name);
-            errors.Add(new CollectorError(name, $"{ex.GetType().Name}: {ex.Message}"));
-            return (new(), new());
         }
     }
 }

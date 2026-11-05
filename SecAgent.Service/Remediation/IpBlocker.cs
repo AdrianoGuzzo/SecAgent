@@ -1,181 +1,229 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Text.Json;
-using System.Text.Json.Serialization;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Remediation;
 
-/// <summary>
-/// Blocks/unblocks a remote IP address by creating a pair of Windows Firewall
-/// rules (inbound + outbound) via the HNetCfg.FwPolicy2 COM interface — the same
-/// API surface used (read-only) by <c>FirewallRulesCollector</c>. Runs as
-/// LocalSystem inside the Service, so it has the privilege to add/remove rules.
-///
-/// State is mirrored to <c>C:\ProgramData\SecAgent\blocked.json</c> after every
-/// change (and rebuilt from the existing SecAgent-Block-* rules on startup, so it
-/// survives reboots). The Tray reads that file to render the "blocked" list.
-/// </summary>
-public class IpBlocker
+public interface IIpBlocker
 {
-    private const int NetFwRuleDirectionIn  = 1;
-    private const int NetFwRuleDirectionOut = 2;
-    private const int NetFwActionBlock      = 0;
-    private const int NetFwProfileAll       = 0x7FFFFFFF;
-    private const int NetFwIpProtocolAny    = 256;
+    /// <summary>Cria as regras In+Out para o IP. True só se as DUAS foram criadas.</summary>
+    bool Block(string ip);
 
-    private const string RulePrefix  = "SecAgent-Block-";
-    private const string BlockedPath = @"C:\ProgramData\SecAgent\blocked.json";
+    /// <summary>Remove as regras do IP. Idempotente.</summary>
+    bool Unblock(string ip);
 
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        WriteIndented = false,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+    /// <summary>Reconstrói blocked.json a partir das regras SecAgent-Block-* existentes.</summary>
+    void Reconcile();
+}
+
+/// <summary>
+/// Bloqueia/desbloqueia um IP remoto criando um par de regras do Windows
+/// Firewall (entrada + saída). Roda como LocalSystem dentro do Service.
+///
+/// O estado é espelhado em <c>blocked.json</c> após cada mudança (e reconstruído
+/// das regras existentes no startup, sobrevivendo a reboots). O Tray lê esse
+/// arquivo para a lista de bloqueados.
+/// </summary>
+public class IpBlocker : IIpBlocker
+{
+    private const string RuleDescription = "Bloqueado pelo SecAgent";
 
     private readonly ILogger<IpBlocker> _logger;
+    private readonly IFirewallPolicy _policy;
+    private readonly TimeProvider _time;
+    private readonly string _blockedPath;
     private readonly object _lock = new();
 
-    public IpBlocker(ILogger<IpBlocker> logger)
+    public IpBlocker(ILogger<IpBlocker> logger, IFirewallPolicy policy, AgentPaths paths, TimeProvider time)
     {
         _logger = logger;
-        // Reconcile blocked.json with whatever rules already exist (post-reboot).
-        try { WriteBlockedFile(); } catch (Exception ex) { _logger.LogError(ex, "IpBlocker startup reconcile failed"); }
+        _policy = policy;
+        _time = time;
+        _blockedPath = paths.BlockedFile;
     }
 
-    /// <summary>Creates inbound+outbound block rules for <paramref name="ip"/>. Idempotent.</summary>
-    public void Block(string ip)
+    public bool Block(string ip)
     {
-        if (!IPAddress.TryParse(ip, out var parsed))
+        if (!IpAddressPolicy.TryParseStrict(ip, out var parsed))
         {
             _logger.LogWarning("IpBlocker.Block ignored invalid IP {Ip}", ip);
-            return;
+            return false;
+        }
+        if (!IpAddressPolicy.IsBlockable(parsed, out var reason))
+        {
+            // Qualquer usuário pode soltar um trigger: não deixamos bloquear
+            // loopback/unspecified/multicast (DoS local trivial).
+            _logger.LogWarning("IpBlocker.Block refused {Ip}: {Reason}", ip, reason);
+            return false;
         }
         var canonical = parsed.ToString();
 
         lock (_lock)
         {
-            dynamic? policy = CreatePolicy();
-            if (policy is null) return;
-
-            // Remove any stale rules of the same name first (idempotent).
-            RemoveRules(policy, canonical);
-            AddRule(policy, canonical, NetFwRuleDirectionIn);
-            AddRule(policy, canonical, NetFwRuleDirectionOut);
-            _logger.LogInformation("Blocked IP {Ip} (inbound+outbound firewall rules)", canonical);
-
-            WriteBlockedFile(policy);
-        }
-    }
-
-    /// <summary>Removes the block rules for <paramref name="ip"/>. Idempotent.</summary>
-    public void Unblock(string ip)
-    {
-        if (!IPAddress.TryParse(ip, out var parsed))
-        {
-            _logger.LogWarning("IpBlocker.Unblock ignored invalid IP {Ip}", ip);
-            return;
-        }
-        var canonical = parsed.ToString();
-
-        lock (_lock)
-        {
-            dynamic? policy = CreatePolicy();
-            if (policy is null) return;
-
-            RemoveRules(policy, canonical);
-            _logger.LogInformation("Unblocked IP {Ip}", canonical);
-
-            WriteBlockedFile(policy);
-        }
-    }
-
-    private dynamic? CreatePolicy()
-    {
-        var t = Type.GetTypeFromProgID("HNetCfg.FwPolicy2");
-        if (t is null) { _logger.LogError("HNetCfg.FwPolicy2 not available"); return null; }
-        try { return Activator.CreateInstance(t); }
-        catch (Exception ex) { _logger.LogError(ex, "Failed to create HNetCfg.FwPolicy2"); return null; }
-    }
-
-    private void AddRule(dynamic policy, string ip, int direction)
-    {
-        try
-        {
-            var rt = Type.GetTypeFromProgID("HNetCfg.FWRule");
-            if (rt is null) return;
-            dynamic rule = Activator.CreateInstance(rt)!;
-            rule.Name = RuleName(ip, direction);
-            rule.Description = "Bloqueado pelo SecAgent";
-            rule.Direction = direction;
-            rule.Action = NetFwActionBlock;
-            rule.Protocol = NetFwIpProtocolAny;
-            rule.RemoteAddresses = ip;
-            rule.Profiles = NetFwProfileAll;
-            rule.Enabled = true;
-            policy.Rules.Add(rule);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to add firewall rule for {Ip} dir {Dir}", ip, direction);
-        }
-    }
-
-    private void RemoveRules(dynamic policy, string ip)
-    {
-        foreach (var dir in new[] { NetFwRuleDirectionIn, NetFwRuleDirectionOut })
-        {
-            try { policy.Rules.Remove(RuleName(ip, dir)); }
-            catch { /* rule may not exist — fine */ }
-        }
-    }
-
-    private static string RuleName(string ip, int direction)
-        => $"{RulePrefix}{ip}-{(direction == NetFwRuleDirectionIn ? "In" : "Out")}";
-
-    /// <summary>Rebuilds blocked.json from the live SecAgent-Block-* rules.</summary>
-    private void WriteBlockedFile(dynamic? policy = null)
-    {
-        policy ??= CreatePolicy();
-        if (policy is null) return;
-
-        var ips = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-        try
-        {
-            foreach (dynamic rule in policy.Rules)
+            try
             {
+                // Remove regras velhas de mesmo nome antes (idempotente).
+                RemoveRules(canonical);
+                _policy.AddBlockRule(BlockRuleName.For(canonical, FirewallConstants.DirectionIn), canonical,
+                    FirewallConstants.DirectionIn, RuleDescription);
                 try
                 {
-                    string name = (string?)rule.Name ?? "";
-                    if (!name.StartsWith(RulePrefix, StringComparison.OrdinalIgnoreCase)) continue;
-                    // Strip prefix and the -In/-Out suffix to recover the IP.
-                    var core = name.Substring(RulePrefix.Length);
-                    int dash = core.LastIndexOf('-');
-                    if (dash > 0) core = core.Substring(0, dash);
-                    if (core.Length > 0) ips.Add(core);
+                    _policy.AddBlockRule(BlockRuleName.For(canonical, FirewallConstants.DirectionOut), canonical,
+                        FirewallConstants.DirectionOut, RuleDescription);
                 }
-                catch { /* skip legacy/orphan rule */ }
+                catch
+                {
+                    // Sem bloqueio "meia-boca": desfaz a regra de entrada.
+                    _policy.RemoveRule(BlockRuleName.For(canonical, FirewallConstants.DirectionIn));
+                    throw;
+                }
+                _logger.LogInformation("Blocked IP {Ip} (inbound+outbound firewall rules)", canonical);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to block IP {Ip}", canonical);
+                return false;
+            }
+            finally
+            {
+                WriteBlockedFile();
             }
         }
+    }
+
+    public bool Unblock(string ip)
+    {
+        if (!IpAddressPolicy.TryParseStrict(ip, out var parsed))
+        {
+            _logger.LogWarning("IpBlocker.Unblock ignored invalid IP {Ip}", ip);
+            return false;
+        }
+        var canonical = parsed.ToString();
+
+        lock (_lock)
+        {
+            try
+            {
+                RemoveRules(canonical);
+                _logger.LogInformation("Unblocked IP {Ip}", canonical);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to unblock IP {Ip}", canonical);
+                return false;
+            }
+            finally
+            {
+                WriteBlockedFile();
+            }
+        }
+    }
+
+    public void Reconcile()
+    {
+        lock (_lock) WriteBlockedFile();
+    }
+
+    private void RemoveRules(string ip)
+    {
+        _policy.RemoveRule(BlockRuleName.For(ip, FirewallConstants.DirectionIn));
+        _policy.RemoveRule(BlockRuleName.For(ip, FirewallConstants.DirectionOut));
+    }
+
+    private void WriteBlockedFile()
+    {
+        IReadOnlyList<string> names;
+        try { names = _policy.GetRuleNames(); }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to enumerate firewall rules for blocked.json");
             return;
         }
 
-        var list = new BlockedList(DateTime.UtcNow, ips.Select(i => new BlockedIp(i)).ToList());
+        var ips = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var name in names)
+            if (BlockRuleName.TryParseIp(name, out var ip)) ips.Add(ip);
+
+        var list = new BlockedList(_time.GetUtcNow().UtcDateTime, ips.Select(i => new BlockedIp(i)).ToList());
         try
         {
-            var dir = Path.GetDirectoryName(BlockedPath);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            var tmp = BlockedPath + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(list, JsonOpts));
-            File.Move(tmp, BlockedPath, overwrite: true);
+            AtomicFile.WriteAllText(_blockedPath, JsonSerializer.Serialize(list, JsonDefaults.Compact));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to write blocked.json");
         }
     }
+}
 
-    private record BlockedList(DateTime UpdatedUtc, List<BlockedIp> Blocked);
-    private record BlockedIp(string Ip);
+/// <summary>Nome das regras: <c>SecAgent-Block-&lt;ip&gt;-In|Out</c>.</summary>
+internal static class BlockRuleName
+{
+    public const string Prefix = "SecAgent-Block-";
+
+    public static string For(string ip, int direction)
+        => $"{Prefix}{ip}-{(direction == FirewallConstants.DirectionIn ? "In" : "Out")}";
+
+    /// <summary>Recupera o IP de um nome de regra do SecAgent (sufixo -In/-Out obrigatório).</summary>
+    public static bool TryParseIp(string? name, out string ip)
+    {
+        ip = "";
+        if (string.IsNullOrEmpty(name) || !name.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase)) return false;
+        var core = name[Prefix.Length..];
+        if (core.EndsWith("-In", StringComparison.OrdinalIgnoreCase)) core = core[..^3];
+        else if (core.EndsWith("-Out", StringComparison.OrdinalIgnoreCase)) core = core[..^4];
+        else return false;
+        if (core.Length == 0) return false;
+        ip = core;
+        return true;
+    }
+}
+
+/// <summary>Validação de IPs vindos do conteúdo de triggers (gravável por qualquer usuário).</summary>
+internal static class IpAddressPolicy
+{
+    /// <summary>
+    /// Parse estrito: IPv4 só na forma pontuada completa (a.b.c.d) — o
+    /// <see cref="IPAddress.TryParse(string, out IPAddress)"/> aceita "1" como 0.0.0.1.
+    /// </summary>
+    public static bool TryParseStrict(string? text, out IPAddress address)
+    {
+        address = IPAddress.None;
+        var s = (text ?? "").Trim();
+        if (s.Length == 0) return false;
+
+        if (s.Contains(':'))
+        {
+            if (!IPAddress.TryParse(s, out var v6) || v6.AddressFamily != AddressFamily.InterNetworkV6) return false;
+            address = v6;
+            return true;
+        }
+
+        var parts = s.Split('.');
+        if (parts.Length != 4) return false;
+        foreach (var p in parts)
+            if (p.Length is 0 or > 3 || !p.All(char.IsAsciiDigit) || int.Parse(p) > 255) return false;
+
+        if (!IPAddress.TryParse(s, out var v4)) return false;
+        address = v4;
+        return true;
+    }
+
+    public static bool IsBlockable(IPAddress ip, out string reason)
+    {
+        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+
+        if (IPAddress.IsLoopback(ip)) { reason = "loopback"; return false; }
+        if (ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any)) { reason = "unspecified"; return false; }
+        if (ip.Equals(IPAddress.Broadcast)) { reason = "broadcast"; return false; }
+        if (ip.AddressFamily == AddressFamily.InterNetwork && ip.GetAddressBytes()[0] is >= 224 and <= 239)
+        { reason = "multicast"; return false; }
+        if (ip.IsIPv6Multicast) { reason = "multicast"; return false; }
+
+        reason = "";
+        return true;
+    }
 }

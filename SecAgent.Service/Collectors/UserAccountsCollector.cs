@@ -1,50 +1,47 @@
-using System.Management;
 using SecAgent.Service.Models;
+using SecAgent.Service.Platform;
 
 namespace SecAgent.Service.Collectors;
 
+/// <summary>Contas locais e membros do grupo Administradores via WMI.</summary>
 public class UserAccountsCollector
 {
+    private readonly IWmiQuery _wmi;
+    private readonly ISystemEnvironment _env;
+
+    public UserAccountsCollector(IWmiQuery wmi, ISystemEnvironment env)
+    {
+        _wmi = wmi;
+        _env = env;
+    }
+
     public (List<UserAccount> Users, List<string> Administrators) Collect()
     {
-        var users = new List<UserAccount>();
-
-        using (var search = new ManagementObjectSearcher(@"root\cimv2",
-            "SELECT Name, FullName, Disabled, PasswordRequired, LocalAccount, SID FROM Win32_UserAccount WHERE LocalAccount=TRUE"))
-        {
-            foreach (ManagementObject obj in search.Get())
-            {
-                users.Add(new UserAccount(
-                    Name: obj["Name"] as string ?? "",
-                    FullName: obj["FullName"] as string,
-                    Disabled: obj["Disabled"] is bool d && d,
-                    PasswordRequired: obj["PasswordRequired"] is bool p && p,
-                    LocalAccount: obj["LocalAccount"] is bool l && l,
-                    SID: obj["SID"] as string));
-            }
-        }
+        var users = _wmi.Query(@"root\cimv2",
+                "SELECT Name, FullName, Disabled, PasswordRequired, LocalAccount, SID FROM Win32_UserAccount WHERE LocalAccount=TRUE")
+            .Select(obj => new UserAccount(
+                Name: WmiValues.GetString(obj, "Name") ?? "",
+                FullName: WmiValues.GetString(obj, "FullName"),
+                Disabled: WmiValues.GetFlag(obj, "Disabled"),
+                PasswordRequired: WmiValues.GetFlag(obj, "PasswordRequired"),
+                LocalAccount: WmiValues.GetFlag(obj, "LocalAccount"),
+                SID: WmiValues.GetString(obj, "SID")))
+            .OrderBy(u => u.Name)
+            .ToList();
 
         var admins = new List<string>();
-        // Administrators group SID is well-known: S-1-5-32-544
-        using (var groupSearch = new ManagementObjectSearcher(@"root\cimv2",
-            "SELECT Name, Domain FROM Win32_Group WHERE SID='S-1-5-32-544'"))
+        // SID bem conhecido do grupo Administradores (independe do idioma).
+        foreach (var group in _wmi.Query(@"root\cimv2", "SELECT Name, Domain FROM Win32_Group WHERE SID='S-1-5-32-544'"))
         {
-            foreach (ManagementObject group in groupSearch.Get())
-            {
-                var domain = group["Domain"] as string ?? Environment.MachineName;
-                var groupName = group["Name"] as string ?? "Administrators";
-                var query = $"ASSOCIATORS OF {{Win32_Group.Domain='{domain}',Name='{groupName}'}} WHERE ResultClass=Win32_Account";
+            var domain = WmiValues.GetString(group, "Domain") ?? _env.MachineName;
+            var groupName = WmiValues.GetString(group, "Name") ?? "Administrators";
+            // Escapa os literais: nomes de domínio/grupo vão entre aspas no WQL.
+            var query = $"ASSOCIATORS OF {{Win32_Group.Domain='{WmiValues.EscapeWql(domain)}',Name='{WmiValues.EscapeWql(groupName)}'}} WHERE ResultClass=Win32_Account";
 
-                using var memberSearch = new ManagementObjectSearcher(@"root\cimv2", query);
-                foreach (ManagementObject m in memberSearch.Get())
-                {
-                    var memberDomain = m["Domain"] as string ?? "";
-                    var memberName = m["Name"] as string ?? "";
-                    admins.Add($"{memberDomain}\\{memberName}");
-                }
-            }
+            foreach (var m in _wmi.Query(@"root\cimv2", query))
+                admins.Add($"{WmiValues.GetString(m, "Domain") ?? ""}\\{WmiValues.GetString(m, "Name") ?? ""}");
         }
 
-        return (users.OrderBy(u => u.Name).ToList(), admins.OrderBy(a => a).ToList());
+        return (users, admins.OrderBy(a => a).ToList());
     }
 }
