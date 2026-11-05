@@ -20,10 +20,17 @@ HNetCfg.FwPolicy2 COM, EventLogWatcher, NTFS ACLs).
 ## Organização
 
 ```
-Program.cs                  # bootstrap DI + AddWindowsService + Channel<SecurityEvent> singleton
-Worker.cs                   # BackgroundService — schedule diário; chama ScanRunner com trigger="scheduled"
-ScanRunner.cs               # orquestra scan+Claude; instrumenta ProgressTracker
-SecurityScanner.cs          # roda os 7 coletores em sequência; Safe() wraps cada um
+Program.cs                  # fino: Host + AddWindowsService + AddSecAgentService (excluído da cobertura)
+ServiceRegistration.cs      # AddSecAgentService: DI, options validadas (ValidateOnStart), adapters, Channel
+Worker.cs                   # BackgroundService — schedule diário via TimeProvider; try/log por execução
+ScanRunner.cs               # IScanRunner: orquestra scan+Claude; single-flight (SemaphoreSlim); ProgressTracker
+SecurityScanner.cs          # roda os 8 coletores em sequência; Safe() wraps cada um
+Diagnostics/TraceLog        # ITraceLog → C:\ProgramData\SecAgent\trace.log (substitui o Trace() estático)
+
+Platform/                   # interfaces dos adapters de SO — ÚNICOS [ExcludeFromCodeCoverage]
+  IWmiQuery, IFirewallPolicy (COM FwPolicy2), IUninstallRegistry, IAclReader,
+  ITcpConnectionSource (IpHlpApi), INetworkInfo, IEventLogSource, IProcessStartSource,
+  IClaudeCli (Process + stdin/stdout + kill da árvore), ISystemEnvironment, ITriggerDirectorySetup
 ScannerOptions.cs           # config do scanner (OutputDirectory, intervalo, pastas críticas)
 StringExtensions.cs         # Truncate() helper
 
@@ -39,38 +46,60 @@ Collectors/                 # Fase 1+4.2 — coleta dados do sistema
 
 Monitors/                   # Fase 3 — push/poll em tempo real
   ProcessMonitor            # WMI __InstanceCreationEvent ISA Win32_Process WITHIN 2
+  IpClassifier              # público/privado/especial (multicast, 0/8, CGNAT, ::ffff:10.x…) — usado pelos dois monitores
   NetworkMonitor            # poll 30s + diff de conexões TCP estabelecidas (só saída)
   NetworkSnapshotService    # poll 2s; GetExtendedTcpTable (PID por conexão) → network.json;
                             # classifica entrada/saída; SecurityEvent + alerts/alert_*.json p/
                             # entrada de IP público (porta sensível=critical; cooldown por IP)
   Native/IpHlpApi           # P/Invoke GetExtendedTcpTable (v4+v6) com PID; byte-swap de portas
-  EventLogMonitor           # EventLogWatcher push em Security + System
-  SuspiciousEventProcessor  # consumer do Channel; sliding window; threshold → Claude
-  MonitorOptions            # whitelists, eventIds, thresholds, SelfReferenceFragments
+  EventLogMonitor           # EventLogWatcher push em Security + System; regras em EventLogRules
+  SuspiciousEventProcessor  # consumer do Channel; journal JSONL sempre grava; IncidentWindow
+                            # (sliding window + threshold + cooldown) → análise em background single-flight
+  MonitorOptions            # whitelists, eventIds, thresholds, SelfReferenceFragments, SelfServiceNames
+
+Remediation/
+  IpBlocker                 # IIpBlocker: regras SecAgent-Block-<ip> In+Out (rollback se uma falhar);
+                            # IpAddressPolicy recusa loopback/unspecified/multicast; blocked.json atômico
 
 Triggers/                   # Fase 4.1 — disparo manual via Tray
-  TriggerWatcher            # FSWatcher em C:\ProgramData\SecAgent\triggers\*.trigger
+  TriggerWatcher            # FSWatcher em triggers\*.trigger (watcher antes do drain; guard in-flight)
+  TriggerPayloadParser      # IP do block/unblock e {model,effort} do scan-and-analyze
   TriggerOptions            # debounce, enabled
 
 Analysis/                   # Fase 2+
-  ClaudeAnalyzer            # AnalyzeAsync (scan) + AnalyzeIncidentAsync; invoca claude -p
-  PromptBuilder             # ScanSummary com filtros agressivos; matching firewall ↔ porta
+  ClaudeAnalyzer            # IClaudeAnalyzer: AnalyzeAsync (scan) + AnalyzeIncidentAsync; via IClaudeCli
+  ClaudeArgsBuilder         # argumentos do claude -p (nunca --bare)
+  ClaudeResponseParser      # envelope JSON, code fence, exit code ≠ 0/envelope nulo = falha
+  ReportMarkdownRenderer    # .md dos relatórios
+  PromptBuilder             # ScanSummary com filtros agressivos; matching firewall ↔ porta; BuildIncident
   ClaudeOptions             # ExePath, Token env var, Model, Timeout, ReportsDir, AnalyzeAfterScan
   StatusFileService         # escreve C:\ProgramData\SecAgent\status.json
   ProgressTracker           # escreve/deleta C:\ProgramData\SecAgent\progress.json
 
 Models/
-  ScanResult                # output dos 7 coletores
-  AnalysisResult            # output do Claude (Findings + AnalysisMeta com tokens)
-  SecurityEvent             # input dos monitores; IncidentReport para análise
-  AgentStatus               # schema do status.json
-  AnalysisProgress          # schema do progress.json
+  ScanResult                # output dos 8 coletores (só o Service usa)
 ```
+
+Os modelos de IPC (`AnalysisResult`, `SecurityEvent`, `IncidentReport`,
+`AgentStatus`, `AnalysisProgress`, `NetworkSnapshot`, `NetworkAlert`,
+`BlockedList`) e os caminhos (`AgentPaths`) moram em **`SecAgent.Contracts`**.
+
+## Testes
+
+`SecAgent.Service.Tests` (xUnit + NSubstitute + `FakeTimeProvider`), gate de
+80% de linhas em `[SecAgent.Service]*` + `[SecAgent.Contracts]*`.
+
+- Coletores/monitores recebem o adapter de `Platform\` → teste com fake/substitute.
+- Lógica dos `BackgroundService` exposta como `internal` (`Poll`, `RunCycle`,
+  `ProcessTriggerAsync`…) para o teste dirigir um ciclo por vez.
+- Tempo sempre via `TimeProvider` (`Task.Delay(ts, time, ct)`); nada de
+  `DateTime.UtcNow` direto.
+- Bug corrigido = teste `Bug_<descrição>` no arquivo do componente.
 
 ## Padrões de código
 
-- **DI**: todo serviço é `AddSingleton<T>` em `Program.cs`. Novos coletores/
-  monitores também.
+- **DI**: todo serviço é registrado em `ServiceRegistration.AddSecAgentService`
+  (singleton, pela interface quando existe). Novos coletores/monitores também.
 - **`BackgroundService`** para qualquer loop contínuo. Cancelable via `stoppingToken`.
 - **`IOptions<T>`** para config. Lê de `appsettings.json` seção
   correspondente.
@@ -94,7 +123,7 @@ Models/
    - Drop wildcard Allow firewall rules
    - Só Block rules viram MatchedRule por porta
    - Truncar RemoteAddresses a 120 chars
-   - IPv6 colapsado em `[IPv6:other]`
+   - IPv6 colapsado em `[IPv6:other]` (exceto `::` e `::1`, que ficam visíveis)
    - Max 5 matched rules por porta
 4. **LocalSystem necessário** para:
    - WMI `root\Microsoft\Windows\Defender` (Defender status)
@@ -103,31 +132,42 @@ Models/
 5. **HNetCfg.FwPolicy2 COM** acessado via dynamic em `FirewallRulesCollector`.
    Não precisa de NuGet — é built-in Windows. Algumas propriedades de regras
    legacy lançam exceção; cada rule está em try/catch.
-6. **SelfReferenceFragments=["SecAgent"]** — filtro vital para evitar
-   auto-detecção (próprio install do serviço gerando event 7045 → Claude
-   flagrava como malware). Aplicado em ProcessMonitor e EventLogMonitor.
-7. **TriggerWatcher cria pasta `triggers/` com ACL** que dá
+6. **Auto-referência é estrita** (evita auto-detecção sem abrir evasão):
+   - EventLog: só o 7045 cujo `ServiceName` é **exatamente** um de
+     `SelfServiceNames` (default `SecAgent`). Antes, qualquer evento contendo
+     "SecAgent" era suprimido — um malware chamado `SecAgentUpdater` passava.
+   - Processo: `SelfReferenceFragments` casam só o **nome do arquivo**, ou o
+     executável está sob o diretório de instalação do serviço.
+7. **Listas de `MonitorOptions` são nullable**; defaults entram via
+   `PostConfigure(ApplyDefaults)` só quando a config não define a lista. (O
+   binder **anexa** a listas já inicializadas — por isso não use inicializador.)
+   Definir a lista no `appsettings.json` **substitui** o default inteiro (ex.:
+   `"NetworkPortWhitelist": [8443]` → só 8443). Atenção: `[]` vazio não gera
+   chave no JSON e cai no default.
+8. **TriggerWatcher cria pasta `triggers/` com ACL** que dá
    `WriteData + CreateFiles` para `Authenticated Users` — Tray (user-mode)
    precisa escrever. Não dá Delete (Service cuida da limpeza).
-8. **Debounce dual** em triggers: client-side (Tray) e server-side
+9. **Debounce dual** em triggers: client-side (Tray) e server-side
    (TriggerWatcher dictionary). Cliques < 30s viram "Aguarde...".
-9. **EndLogger min level**: o EventLog provider do .NET só loga Warning+.
-   `LogInformation` NÃO aparece no Event Viewer. Para debug profundo, use
-   `Trace()` em ScanRunner.cs / ClaudeAnalyzer.cs → escreve a
+10. **EventLog min level**: o EventLog provider do .NET só loga Warning+.
+   `LogInformation` NÃO aparece no Event Viewer. Para debug profundo, injete
+   `ITraceLog` (usado pelo ClaudeAnalyzer) → escreve a
    `C:\ProgramData\SecAgent\trace.log`.
-10. **Token rotation**: long-lived OAuth pode expirar/ser revogado. Logar
+11. **Token rotation**: long-lived OAuth pode expirar/ser revogado. Logar
     "Not logged in" no stdout do claude.exe é o sintoma — rodar
     `claude setup-token` + `update-token.ps1` + `Restart-Service SecAgent`.
 
 ## Adicionar novo coletor
 
-1. Criar `Collectors/MyCollector.cs` com método `Collect()` retornando seu
-   sub-modelo.
-2. Adicionar record em `Models/ScanResult.cs` e campo em `ScanResult`.
-3. Inject em `SecurityScanner` constructor.
-4. Chamar em `RunFullScan()` com `Safe(...)` wrapper.
-5. Registrar em `Program.cs`: `builder.Services.AddSingleton<MyCollector>()`.
-6. Se for relevante para Claude, ajustar `PromptBuilder.Summarize()` para
+1. Escrever o teste primeiro (`Collectors/CollectorTests.cs`) com o adapter fake.
+2. Criar `Collectors/MyCollector.cs` com método `Collect()` retornando seu
+   sub-modelo; acesso ao SO só pelo adapter de `Platform\` (crie um se preciso,
+   fino e `[ExcludeFromCodeCoverage]`).
+3. Adicionar record em `Models/ScanResult.cs` e campo em `ScanResult`.
+4. Inject em `SecurityScanner` constructor.
+5. Chamar em `RunFullScan()` com `Safe(...)` wrapper.
+6. Registrar em `ServiceRegistration.AddSecAgentService`.
+7. Se for relevante para Claude, ajustar `PromptBuilder.Summarize()` para
    incluir no `ScanSummary` (decidir se precisa filtragem/redução de
    tokens).
 
@@ -137,22 +177,24 @@ Models/
 2. Inject `Channel<SecurityEvent>` writer + `MonitorOptions` + logger.
 3. Emit eventos via `_writer.TryWrite(new SecurityEvent(...))`.
 4. Aplicar `_opts.SelfReferenceFragments` se relevante.
-5. Registrar em `Program.cs`: `AddHostedService<MyMonitor>()`.
-6. Atualizar `MonitorOptions` com config próprios (whitelists, intervalos).
+5. Registrar em `ServiceRegistration.AddSecAgentService`: `AddHostedService<MyMonitor>()`.
+6. Atualizar `MonitorOptions` com config próprios — listas **nullable** com
+   default em `ApplyDefaults()`; intervalos validados em `ServiceRegistration`.
+7. Extraia o ciclo para um método `internal` testável.
 
 ## Adicionar novo trigger type
 
-1. Adicionar constante `MyTrigger = "my-trigger.trigger"` em `TriggerWatcher`.
-2. Adicionar case no switch de `ProcessTriggerAsync`.
+1. Adicionar a constante em `SecAgent.Contracts/TriggerNames.cs` (compartilhada).
+2. Adicionar case no switch de `TriggerWatcher.ProcessTriggerAsync` (+ teste).
 3. Adicionar método ao `ScanRunner` (ou outro serviço) que faz o trabalho.
-4. Atualizar `TrayApplicationContext.BuildMenu` com novo menu item que
-   chama `RequestTrigger(MyTrigger, "...")`.
+4. No Tray: item em `TrayApplicationContext.BuildMenu` e/ou comando em
+   `DashboardCommandParser`, chamando `RequestTrigger(TriggerNames.MyTrigger, "...")`.
 
 ## Custo / latência típicos
 
 | Operação | Latência | Custo equivalente API |
 |---|---|---|
-| Scan completo (7 coletores) | ~1-2s | $0 |
+| Scan completo (8 coletores) | ~1-2s | $0 |
 | Análise Claude do scan (Haiku) | ~45-90s | ~$0.08-0.12 |
 | Análise Claude de incidente (Haiku) | ~15-30s | ~$0.025 |
 

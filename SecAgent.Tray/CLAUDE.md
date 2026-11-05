@@ -25,18 +25,26 @@ Target: `net8.0-windows`. WinExe (não tem console).
 ## Organização
 
 ```
-Program.cs                    # entry point [STAThread] → Application.Run(new TrayApplicationContext())
-TrayApplicationContext.cs     # ApplicationContext: NotifyIcon, ContextMenuStrip, watchers, timers, ShowDashboard
-DashboardForm.cs              # janela WebView2 (painel amigável); init async + runtime check + fallback .md
-DataPump.cs                   # lê todos os arquivos do Service e empurra mensagens p/ a página (só com janela aberta)
-GeoLookup.cs                  # ip-api.com (país/cidade/ISP) com cache + rate-limit; instância
-                              # compartilhada e sempre ativa (alertas + dashboard); ResolveNowAsync p/ toast
+Program.cs                    # entry point [STAThread] → Application.Run(new TrayApplicationContext())  (glue)
+TrayApplicationContext.cs     # glue: NotifyIcon, menu, watchers, timers, ShowDashboard — aplica o Core
+DashboardForm.cs              # glue: janela WebView2; init async + runtime check + fallback .md
+TokenSetupForm.cs             # glue: janela "Configurar IA" (setup-token + gravação elevada)
+DataPump.cs                   # lê os arquivos do Service e empurra mensagens p/ a página (só com janela aberta)
+GeoLookup.cs                  # IGeoLookup: ip-api.com com cache em disco, negative-cache em memória,
+                              # rate-limit 40/min; instância compartilhada (alertas + dashboard)
+TokenSetup.cs                 # token configurado? / localizar claude.exe (fontes injetáveis)
+UserInstall.cs                # glue: opt-out por usuário do autostart (HKCU\Software\SecAgent\TrayDisabled)
+Core/                         # lógica pura e testada (sem WinForms):
+  DashboardCommand.cs         #   DashboardCommandParser: {cmd} da página → comando tipado
+  TriggerRequester.cs         #   grava triggers\*.trigger com debounce → Ok/Debounced/Denied/Failed
+  TrayStatePresenter.cs       #   ícone, tooltips (≤127), toasts, progresso órfão (IsStale)
+  JsonFileReader.cs           #   leitura com retry ASSÍNCRONO (nunca Thread.Sleep na UI)
+  EventsTail.cs               #   tail do events\*.jsonl por offset em bytes (só linhas completas)
+  DashboardAssets.cs          #   inline de CSS/JS embutidos no dashboard.html
+  WebMessage.cs               #   envelope {type,payload} + fila de mensagens até o WebView2 ficar pronto
+  TokenCommands.cs            #   script PowerShell elevado (-EncodedCommand) + comando do setup-token
+  AiPrefsStore.cs             #   último modelo/esforço escolhido (%LOCALAPPDATA%\SecAgent\ai-prefs.json)
 Assets/dashboard.html         # SPA (EmbeddedResource) renderizada via NavigateToString
-UserInstall.cs                # opt-out por usuário do autostart (HKCU\Software\SecAgent\TrayDisabled);
-                              # remoção "deste usuário" sem admin + limpeza do HKCU\Run legado
-AgentStatus.cs                # mirror do schema do Service (evita project reference)
-AnalysisProgress.cs           # mirror do schema do Service
-Models/                       # mirrors: AnalysisResult/Finding/Meta, SecurityEvent, IncidentReport, NetworkSnapshot/Connection
 install-tray.ps1              # publish + registra HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SecAgentTray
 uninstall-tray.ps1
 ```
@@ -53,8 +61,9 @@ janela (singleton em `_dashboard`). O **host C# faz toda a leitura de arquivo**
   `DashboardForm` → callback `OnDashboardCommand` → `RequestTrigger` (mesmo
   debounce do menu).
 - **Casing**: o Service grava JSON **PascalCase**; a página lê **camelCase**.
-  `DataPump.ReadAndCamel<T>` desserializa e re-serializa com `JsonNamingPolicy.
-  CamelCase` (idem `OutOpts` para events/geo). Não pular essa normalização.
+  `JsonFileReader.ReadAsCamelAsync<T>` desserializa no modelo de
+  `SecAgent.Contracts` e re-serializa com `JsonDefaults.CamelCase`. Não pular
+  essa normalização.
 - WebView2: pacote NuGet `Microsoft.Web.WebView2`; user-data em
   `%LOCALAPPDATA%\SecAgent\WebView2`. Runtime já vem no Win11; se faltar,
   `DashboardForm` cai no fallback de abrir o `.md`.
@@ -103,10 +112,21 @@ seguir esse padrão**:
 - `FileSystemWatcher _scanWatcher` — `scans\*.json` → toast no Created
   (suprimido durante scan+Claude para evitar duplo toast)
 - `FileSystemWatcher _progressWatcher` — `progress.json` Created/Changed/
-  Deleted → swap icon + tooltip + transition toast
+  **Renamed**/Deleted → swap icon + tooltip + transition toast
+- `FileSystemWatcher` de `alerts\alert_*.json` — toast imediato (sempre ativo)
 
-Tudo é dispatched pelo `ContextMenuStrip.BeginInvoke` quando vem de
-worker thread.
+Tudo é dispatched pelo `ContextMenuStrip.BeginInvoke` (`OnUi`) quando vem de
+worker thread. **Regra**: o `TrayApplicationContext` só aplica o resultado do
+`TrayStatePresenter`/`TriggerRequester`/`DashboardCommandParser`; qualquer `if`
+de regra novo vai para `Core/` com teste.
+
+## Testes
+
+`SecAgent.Tray.Tests` (xUnit + NSubstitute + `FakeTimeProvider`), gate de 80%
+de linhas em `[SecAgent.Tray]*`. Glue de WinForms/WebView2/registro é
+`[ExcludeFromCodeCoverage]`. `GeoLookup` e `DataPump` têm construtores
+`internal` que recebem caminho, `HttpMessageHandler`, `AgentPaths` e
+`TimeProvider` — use-os nos testes (nunca a rede ou `C:\ProgramData`).
 
 ## Comunicação com Service
 
@@ -134,11 +154,15 @@ worker thread.
 | Progresso ativo (qualquer estado) | `SystemIcons.Information` (azul "busy") |
 
 Campo `_severityIcon` guarda o ícone "idle" (driven by status.json). Quando
-`OnProgressFileEvent` dispara, `_icon.Icon` vira `Information`; quando
-`OnProgressFileDeleted` dispara, restaura `_severityIcon`.
+`OnProgressChangedAsync` lê um progresso, `_icon.Icon` vira `Information`;
+quando `progress.json` é apagado (`OnProgressDeleted`), restaura `_severityIcon`.
 
-`RefreshStatus()` só toca `_icon.Icon` quando `_currentProgress is null` —
+`RefreshStatusAsync()` só toca `_icon.Icon` quando `_currentProgress is null` —
 caso contrário deixa o busy icon em paz.
+
+**Progresso órfão**: se o Service cair no meio do scan, `progress.json` fica
+para trás. `TrayStatePresenter.IsStale` (> 15 min) faz o Tray voltar ao ícone
+de severidade.
 
 ## Gotchas críticos
 
@@ -155,12 +179,11 @@ caso contrário deixa o busy icon em paz.
 3. **`ShowBalloonTip` no Windows 10/11** automaticamente vira toast moderno
    no Action Center. Não precisa `Microsoft.Toolkit.Uwp.Notifications` nem
    nenhuma dep extra.
-4. **Mirrors de records** (AgentStatus, AnalysisProgress) **devem casar com
-   o Service** (mesmas propriedades e nomes). Project reference seria mais
-   limpo mas puxa dependências do service (WMI etc). Optei por duplicação
-   mínima.
-5. **`progress.json` pode estar mid-write** quando watcher dispara. Read
-   com retry curto (3 tentativas × 80ms) em `OnProgressFileEvent`.
+4. **Modelos vêm de `SecAgent.Contracts`** (referência de projeto, sem
+   dependências de WMI etc.). Não recrie mirrors no Tray.
+5. **`progress.json` pode estar mid-write** quando watcher dispara. Use
+   `JsonFileReader.ReadAsync<T>` (3 tentativas × 80ms, **assíncrono**) — nunca
+   `Thread.Sleep` em watcher ou na UI thread.
 6. **install-tray.ps1 NÃO precisa admin** — escreve em `HKCU` e roda como
    usuário. Se exigir admin, algo quebrou.
 7. **Não publish enquanto o tray está rodando** — `install-tray.ps1` mata
@@ -174,26 +197,21 @@ menu.Items.Add("Nova ação", null, (_, _) => DoSomething());
 ```
 
 Para um trigger novo:
-1. Adicionar constante `private const string MyTrigger = "my.trigger";`
-2. Item de menu chama `RequestTrigger(MyTrigger, "Mensagem do toast inicial...")`
+1. Adicionar constante em `SecAgent.Contracts/TriggerNames.cs`
+2. Item de menu chama `RequestTrigger(TriggerNames.MyTrigger, "Mensagem do toast inicial...")`
 3. **Implementar o handler no Service** (`SecAgent.Service/Triggers/TriggerWatcher.cs`)
    — caso contrário o trigger será deletado sem ação.
 
 ## Adicionar novo watcher
 
-Padrão (em ctor):
+Padrão (em ctor), via helper `Watch` — já assina Created **e Renamed**
+(escrita atômica do Service) e guarda o watcher para o `Dispose`:
 ```csharp
-try {
-    _myWatcher = new FileSystemWatcher(SomeDir, "pattern") {
-        EnableRaisingEvents = true,
-        NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite
-    };
-    _myWatcher.Created += OnMyEvent;
-} catch { /* dir may not exist yet — ok */ }
+Watch(_paths.SomeDir, "pattern", created: e => OnMyEvent(e));
 ```
 
-Handler precisa do invoke required check (vide gotcha #1) e do `Dispose()`
-em `Dispose(bool disposing)`.
+Handler que toca UI passa por `OnUi(...)` (vide gotcha #1); leitura de
+arquivo com `JsonFileReader` (async).
 
 ## Debug
 
