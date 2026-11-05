@@ -365,3 +365,6 @@ FodyWeavers.xsd
 # SecAgent.Installer - artefatos gerados (binarios publicados + setup.exe)
 SecAgent.Installer/publish/
 SecAgent.Installer/output/
+# Saída de testes/cobertura local
+TestResults/
+coverage-report/

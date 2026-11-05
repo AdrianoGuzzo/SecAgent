@@ -1,5 +1,7 @@
 <Solution>
+  <Project Path="SecAgent.Contracts/SecAgent.Contracts.csproj" />
   <Project Path="SecAgent.Service/SecAgent.Service.csproj" />
-  <Project Path="SecAgent.Spike/SecAgent.Spike.csproj" />
+  <Project Path="SecAgent.Service.Tests/SecAgent.Service.Tests.csproj" />
   <Project Path="SecAgent.Tray/SecAgent.Tray.csproj" />
+  <Project Path="SecAgent.Tray.Tests/SecAgent.Tray.Tests.csproj" />
 </Solution>

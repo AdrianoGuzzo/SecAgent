@@ -10,7 +10,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) { Write-Error "Must run as Administrator."; exit 1 }
 
 $serviceName = 'SecAgent'
-$exePath = 'C:\Projetos\SecAgent\SecAgent.Service\bin\publish\SecAgent.Service.exe'
+$exePath = Join-Path $PSScriptRoot 'bin\publish\SecAgent.Service.exe'
 
 if (-not (Test-Path $exePath)) {
     Write-Error "Binary not found at $exePath. Run 'dotnet publish' first."

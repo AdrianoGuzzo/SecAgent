@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Write-Error "Must run as Administrator."; exit 1 }
 
-$projectDir = 'C:\Projetos\SecAgent\SecAgent.Service'
+$projectDir = $PSScriptRoot   # funciona em qualquer clone/worktree
 $serviceName = 'SecAgent'
 
 # 1. Stop the service so the published exe can be overwritten
